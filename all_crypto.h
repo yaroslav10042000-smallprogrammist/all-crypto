@@ -20,8 +20,6 @@
 #include <random>
 #include <sys/stat.h>
 #include <errno.h>
-#include <thread>    // для turbo_ (std::thread)
-#include <atomic>    // для std::atomic (в turbo_r)
 #ifdef __aarch64__
     #include <arm_neon.h>
 #elif defined(__x86_64__)
@@ -578,35 +576,31 @@ namespace _sha256 {
     inline uint32_t SS1(uint32_t x){return R(x,17)^R(x,19)^(x>>10);}
     
     inline vector<uint8_t> hash_raw(const vector<uint8_t>& data){
-        uint32_t S[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-        vector<uint8_t> d=data;
-        uint64_t bl = (uint64_t)d.size() * 8; 
-        
-        d.push_back(0x80); 
-        while((d.size()%64)!=56) d.push_back(0);
-        for(int i=7;i>=0;i--) d.push_back((bl>>(i*8))&0xff);
-        
-        for(size_t c=0;c<d.size();c+=64){
-            uint32_t w[64],a=S[0],b=S[1],cc=S[2],dd=S[3],e=S[4],f=S[5],g=S[6],h=S[7];
-            for(int i=0;i<16;i++) w[i]=(d[c+i*4]<<24)|(d[c+i*4+1]<<16)|(d[c+i*4+2]<<8)|d[c+i*4+3];
-            for(int i=16;i<64;i++) w[i]=SS1(w[i-2])+w[i-7]+SS0(w[i-15])+w[i-16];
-            for(int i=0;i<64;i++){
-                uint32_t t1=h+BS1(e)+CH(e,f,g)+K[i]+w[i], t2=BS0(a)+MAJ(a,b,cc);
-                h=g;g=f;f=e;e=dd+t1;dd=cc;cc=b;b=a;a=t1+t2;
-            }
-            S[0]+=a;S[1]+=b;S[2]+=cc;S[3]+=dd;S[4]+=e;S[5]+=f;S[6]+=g;S[7]+=h;
-        }
-        
-        // Исправление вывода: Big-Endian
-        uint8_t out[32];
-        for (int i = 0; i < 8; i++) {
-            out[i*4+0] = (S[i] >> 24) & 0xFF;
-            out[i*4+1] = (S[i] >> 16) & 0xFF;
-            out[i*4+2] = (S[i] >> 8) & 0xFF;
-            out[i*4+3] = S[i] & 0xFF;
-        }
-        return vector<uint8_t>(out, out + 32);
-    }
+    // NOCOPY: стрим из data.data(), хвост паддинга локальный (128 байт)
+    uint32_t S[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    const uint8_t* p=data.data(); size_t n=data.size();
+    uint64_t bl=(uint64_t)n*8;
+    auto block=[&](const uint8_t* q){
+        uint32_t w[64],a=S[0],b=S[1],c=S[2],d=S[3],e=S[4],f=S[5],g=S[6],h=S[7];
+        for(int i=0;i<16;i++) w[i]=((uint32_t)q[i*4]<<24)|((uint32_t)q[i*4+1]<<16)|((uint32_t)q[i*4+2]<<8)|(uint32_t)q[i*4+3];
+        for(int i=16;i<64;i++) w[i]=SS1(w[i-2])+w[i-7]+SS0(w[i-15])+w[i-16];
+        for(int i=0;i<64;i++){ uint32_t t1=h+BS1(e)+CH(e,f,g)+K[i]+w[i], t2=BS0(a)+MAJ(a,b,c);
+            h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
+        S[0]+=a;S[1]+=b;S[2]+=c;S[3]+=d;S[4]+=e;S[5]+=f;S[6]+=g;S[7]+=h;
+    };
+    size_t full=n&~(size_t)63;
+    for(size_t c=0;c<full;c+=64) block(p+c);
+    uint8_t tail[128]; size_t rem=n-full;
+    for(size_t i=0;i<rem;i++) tail[i]=p[full+i];
+    tail[rem]=0x80;
+    size_t padto=(rem<56)?56:120;
+    for(size_t i=rem+1;i<padto;i++) tail[i]=0;
+    for(int i=7;i>=0;i--) tail[padto+(7-i)]=(uint8_t)((bl>>(i*8))&0xff);
+    for(size_t c=0;c<((padto==56)?64:128);c+=64) block(tail+c);
+    uint8_t out[32];
+    for(int i=0;i<8;i++){ out[i*4]=(S[i]>>24)&0xFF; out[i*4+1]=(S[i]>>16)&0xFF; out[i*4+2]=(S[i]>>8)&0xFF; out[i*4+3]=S[i]&0xFF; }
+    return vector<uint8_t>(out,out+32);
+}
 }
 inline string sha256(const vector<uint8_t>& d){ return _::H(_sha256::hash_raw(d)); }
 inline string sha256(const string& d){ return sha256(_::B(d)); }
@@ -621,8 +615,6 @@ inline void sha256(const string& d, vector<uint8_t>& out){ out = _sha256::hash_r
 inline void sha256(const vector<uint8_t>& d, uint32_t salt, vector<uint8_t>& out){ out = _sha256::hash_raw(_::C(d, _::bytes(salt))); }
 inline void sha256(const string& d, uint32_t salt, vector<uint8_t>& out){ out = _sha256::hash_raw(_::C(_::B(d), _::bytes(salt))); }
 inline void sha256(const string& d, const string& path, bool write){ if(write){ auto h = sha256(d); ofstream f(path); f << h; } }
-
-
 
 // ==================== SHA-512 ====================
 // Self-contained SHA-512 (FIPS 180-4). No OpenSSL. Endian-independent.
@@ -773,13 +765,6 @@ inline std::string sha512(const std::string& data, uint64_t salt) {
 
 // ==================== MD5 ====================
 
-
-
-
-
-
-
-
 // ==================== MD5 ====================
 // ==================== MD5 ====================
 // ==================== MD5 ====================
@@ -805,15 +790,21 @@ namespace _md5 {
     
     inline vector<uint8_t> hash_raw(const vector<uint8_t>& data){
         uint32_t a0=0x67452301,b0=0xefcdab89,c0=0x98badcfe,d0=0x10325476;
-        vector<uint8_t> d=data;
-        uint64_t orig_bitlen=d.size()*8;
-        d.push_back(0x80); while((d.size()%64)!=56) d.push_back(0);
-        d.push_back(orig_bitlen&0xff); d.push_back((orig_bitlen>>8)&0xff);
-        d.push_back((orig_bitlen>>16)&0xff); d.push_back((orig_bitlen>>24)&0xff);
-        d.push_back((orig_bitlen>>32)&0xff); d.push_back((orig_bitlen>>40)&0xff);
-        d.push_back((orig_bitlen>>48)&0xff); d.push_back((orig_bitlen>>56)&0xff);
-        for(size_t off=0;off<d.size();off+=64){
-            uint32_t M[16]; for(int i=0;i<16;i++) M[i]=(d[off+i*4])|(d[off+i*4+1]<<8)|(d[off+i*4+2]<<16)|(d[off+i*4+3]<<24);
+        const uint8_t* src_=data.data(); size_t n_=data.size();   // NOCOPY-ALL
+    size_t full_=n_-n_%(64);
+    vector<uint8_t> tail_(src_+full_, src_+n_);
+
+        uint64_t orig_bitlen=n_*8;
+        tail_.push_back(0x80); while((tail_.size()%64)!=56) tail_.push_back(0);
+        tail_.push_back(orig_bitlen&0xff); tail_.push_back((orig_bitlen>>8)&0xff);
+        tail_.push_back((orig_bitlen>>16)&0xff); tail_.push_back((orig_bitlen>>24)&0xff);
+        tail_.push_back((orig_bitlen>>32)&0xff); tail_.push_back((orig_bitlen>>40)&0xff);
+        tail_.push_back((orig_bitlen>>48)&0xff); tail_.push_back((orig_bitlen>>56)&0xff);
+            size_t total_=full_+tail_.size();
+    auto at_=[&](size_t i)->uint8_t{ return i<full_? src_[i] : tail_[i-full_]; };
+    auto ptr_=[&](size_t i)->const uint8_t*{ return i<full_? src_+i : tail_.data()+(i-full_); };
+for(size_t off=0;off<total_;off+=64){
+            uint32_t M[16]; for(int i=0;i<16;i++) M[i]=(at_(off+i*4))|(at_(off+i*4+1)<<8)|(at_(off+i*4+2)<<16)|(at_(off+i*4+3)<<24);
             uint32_t A=a0,B=b0,C=c0,D=d0;
             for(int i=0;i<64;i++){
                 uint32_t f,g;
@@ -846,13 +837,19 @@ namespace _sha1 {
     inline uint32_t leftrotate(uint32_t x,uint32_t c){return (x<<c)|(x>>(32-c));}
     inline vector<uint8_t> hash_raw(const vector<uint8_t>& data){
         uint32_t h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
-        vector<uint8_t> d=data;
-        uint64_t bitlen=d.size()*8;
-        d.push_back(0x80); while((d.size()%64)!=56) d.push_back(0);
-        for(int i=7;i>=0;i--) d.push_back((bitlen>>(i*8))&0xff);
-        for(size_t off=0;off<d.size();off+=64){
+        const uint8_t* src_=data.data(); size_t n_=data.size();   // NOCOPY-ALL
+    size_t full_=n_-n_%(64);
+    vector<uint8_t> tail_(src_+full_, src_+n_);
+
+        uint64_t bitlen=n_*8;
+        tail_.push_back(0x80); while((tail_.size()%64)!=56) tail_.push_back(0);
+        for(int i=7;i>=0;i--) tail_.push_back((bitlen>>(i*8))&0xff);
+            size_t total_=full_+tail_.size();
+    auto at_=[&](size_t i)->uint8_t{ return i<full_? src_[i] : tail_[i-full_]; };
+    auto ptr_=[&](size_t i)->const uint8_t*{ return i<full_? src_+i : tail_.data()+(i-full_); };
+for(size_t off=0;off<total_;off+=64){
             uint32_t w[80];
-            for(int i=0;i<16;i++) w[i]=(d[off+i*4]<<24)|(d[off+i*4+1]<<16)|(d[off+i*4+2]<<8)|d[off+i*4+3];
+            for(int i=0;i<16;i++) w[i]=(at_(off+i*4)<<24)|(at_(off+i*4+1)<<16)|(at_(off+i*4+2)<<8)|at_(off+i*4+3);
             for(int i=16;i<80;i++) w[i]=leftrotate(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
             uint32_t a=h0,b=h1,c=h2,d2=h3,e=h4;
             for(int i=0;i<80;i++){
@@ -940,15 +937,21 @@ namespace _sha3 {
     __attribute__((noinline))
     inline vector<uint8_t> hash_raw(const vector<uint8_t>& data, int outbits){
         int rate_bytes = (1600 - outbits * 2) / 8;
-        vector<uint8_t> d = data;
-        d.push_back(0x06);
-        while(d.size() % rate_bytes != rate_bytes - 1) d.push_back(0);
-        d.push_back(0x80);
+        const uint8_t* src_=data.data(); size_t n_=data.size();   // NOCOPY-ALL
+    size_t full_=n_-n_%(rate_bytes);
+    vector<uint8_t> tail_(src_+full_, src_+n_);
+
+        tail_.push_back(0x06);
+        while(tail_.size() % rate_bytes != rate_bytes - 1) tail_.push_back(0);
+        tail_.push_back(0x80);
         
         uint64_t S[25] = {0};
-        for(size_t i=0; i<d.size(); i+=rate_bytes){
-            for(int j=0; j<rate_bytes && i+j<d.size(); j++){
-                S[j/8] ^= ((uint64_t)d[i+j]) << ((j%8)*8);
+            size_t total_=full_+tail_.size();
+    auto at_=[&](size_t i)->uint8_t{ return i<full_? src_[i] : tail_[i-full_]; };
+    auto ptr_=[&](size_t i)->const uint8_t*{ return i<full_? src_+i : tail_.data()+(i-full_); };
+for(size_t i=0; i<total_; i+=rate_bytes){
+            for(int j=0; j<rate_bytes && i+j<total_; j++){
+                S[j/8] ^= ((uint64_t)at_(i+j)) << ((j%8)*8);
             }
             keccak_f(S);
         }
@@ -993,16 +996,22 @@ namespace _blake2b {
     inline vector<uint8_t> hash_raw(const vector<uint8_t>& data,size_t outlen=64){
         uint64_t h[8]; memcpy(h,IV,sizeof(IV));
         h[0]^=0x01010000^(outlen<<0);
-        vector<uint8_t> d=data;
-        size_t dlen=d.size();
-        d.resize(((dlen+127)/128)*128,0);
+        const uint8_t* src_=data.data(); size_t n_=data.size();   // NOCOPY-ALL
+    size_t full_=n_-n_%(128);
+    vector<uint8_t> tail_(src_+full_, src_+n_);
+
+        size_t dlen=n_;
+        if(!tail_.empty()) tail_.resize(128,0);
         uint64_t t0=0,t1=0;
-        for(size_t i=0;i<d.size();i+=128){
+            size_t total_=full_+tail_.size();
+    auto at_=[&](size_t i)->uint8_t{ return i<full_? src_[i] : tail_[i-full_]; };
+    auto ptr_=[&](size_t i)->const uint8_t*{ return i<full_? src_+i : tail_.data()+(i-full_); };
+for(size_t i=0;i<total_;i+=128){
             t0+=128; if(t0<128) t1++;
             uint64_t v[16]; memcpy(v,h,64); for(int j=0;j<8;j++) v[j+8]=IV[j];
             v[12]^=t0; v[13]^=t1;
             uint64_t m[16];
-            for(int j=0;j<16;j++) m[j]=((uint64_t*)&d[i])[j];
+            for(int j=0;j<16;j++) m[j]=((uint64_t*)ptr_(i))[j];
             for(int r=0;r<12;r++){
                 G(v[0],v[4],v[8],v[12],m[SIGMA[r][0]],m[SIGMA[r][1]]);
                 G(v[1],v[5],v[9],v[13],m[SIGMA[r][2]],m[SIGMA[r][3]]);
@@ -1025,8 +1034,6 @@ inline string blake2b(const string& d,uint64_t salt){ return blake2b(d+to_string
 inline void blake2b(const string& d,vector<uint8_t>& out){ out=_blake2b::hash_raw(_::B(d)); }
 
 inline string blake2s(const string& d){ return blake2b(d).substr(0,64); }
-
-
 
 // ==================== ГОСТ Р 34.11-2012 (Стрибог) ====================
 // Self-contained Streebog-256/512 (GOST R 34.11-2012 / RFC 6986). No OpenSSL.
@@ -1253,15 +1260,6 @@ inline std::string stribog512(const void* data, size_t len) {
 
 // ==================== AES-256 ====================
 
-
-
-
-
-
-
-
-
-
 // ==================== AES-256 ====================
 
 // ==================== AES-256 ====================
@@ -1427,18 +1425,21 @@ namespace _aes {
     }
 
     inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& iv){
-        uint8_t rk[240]; KeyExpansion(key.data(),rk);
-        vector<uint8_t> p=plain;
-        while(p.size()%16) p.push_back(0);
-        vector<uint8_t> res(p.size());
-        uint8_t prev[16]; memcpy(prev, iv.data(), 16);
-        for(size_t i=0;i<p.size();i+=16){
-            for(int j=0;j<16;j++) res[i+j]=p[i+j]^prev[j];
-            Cipher(&res[i],rk);
-            memcpy(prev, &res[i], 16);
-        }
-        return res;
-    }
+    // NOCOPY: паддинг собирается на лету из источника, копии входа нет
+    uint8_t rk[240]; KeyExpansion(key.data(),rk);
+    size_t rem=plain.size()%16; size_t full=plain.size()-rem;
+    uint8_t pad=0; size_t outsz=rem?full+16:full;
+    vector<uint8_t> res(outsz);
+    uint8_t prev[16]; memcpy(prev,iv.data(),16);
+    const uint8_t* src=plain.data();
+    for(size_t i=0;i<full;i+=16){ uint8_t blk[16];
+        for(int j=0;j<16;j++) blk[j]=(uint8_t)(src[i+j]^prev[j]);
+        Cipher(blk,rk); memcpy(&res[i],blk,16); memcpy(prev,blk,16); }
+    if(rem||false){ uint8_t blk[16];
+        for(size_t j=0;j<16;j++){ uint8_t b=(j<rem)?src[full+j]:pad; blk[j]=(uint8_t)(b^prev[j]); }
+        Cipher(blk,rk); memcpy(&res[full],blk,16); }
+    return res;
+}
     inline vector<uint8_t> decrypt_raw(const vector<uint8_t>& cipher,const vector<uint8_t>& key,const vector<uint8_t>& iv){
         uint8_t rk[240]; KeyExpansion(key.data(),rk);
         vector<uint8_t> res(cipher.size());
@@ -2737,45 +2738,7 @@ public:
 #endif  // _WIN32
 } // namespace fs_
 
-// ==================== turbo.h (МАКРОСЫ ДЛЯ ПРОСТОТЫ) ====================
-namespace turbo_ {
-
-inline size_t cores() {
-    return max(1u, thread::hardware_concurrency());
-}
-
-template<typename F>
-inline void run(F&& func) {
-    size_t n = cores();
-    if (n <= 1) { func(); return; }
-    
-    vector<thread> threads;
-    for (size_t i = 0; i < n; i++)
-        threads.emplace_back(func);
-    for (auto& t : threads) t.join();
-}
-
-template<typename F>
-inline void repeat(size_t count, F&& func) {
-    size_t n = min(cores(), count);
-    size_t per = (count + n - 1) / n;
-    
-    vector<thread> threads;
-    for (size_t t = 0; t < n; t++) {
-        threads.emplace_back([=]() {
-            size_t start = t * per;
-            size_t end = min(start + per, count);
-            for (size_t i = start; i < end; i++) func();
-        });
-    }
-    for (auto& t : threads) t.join();
-}
-
-} // namespace turbo_
-
 // Макросы
-#define turbo(call)   turbo_::run([&]() { call; })
-#define turbo_r(n, call) turbo_::repeat(n, [&]() { call; })
 
 // ==================== PERLIN NOISE ====================
 namespace perlin_ {
