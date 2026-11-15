@@ -20,6 +20,8 @@
 #include <random>
 #include <sys/stat.h>
 #include <errno.h>
+#include <thread>    // для turbo_ (std::thread)
+#include <atomic>    // для std::atomic (в turbo_r)
 #ifdef __aarch64__
     #include <arm_neon.h>
 #elif defined(__x86_64__)
@@ -616,6 +618,8 @@ inline void sha256(const vector<uint8_t>& d, uint32_t salt, vector<uint8_t>& out
 inline void sha256(const string& d, uint32_t salt, vector<uint8_t>& out){ out = _sha256::hash_raw(_::C(_::B(d), _::bytes(salt))); }
 inline void sha256(const string& d, const string& path, bool write){ if(write){ auto h = sha256(d); ofstream f(path); f << h; } }
 
+
+
 // ==================== SHA-512 ====================
 // Self-contained SHA-512 (FIPS 180-4). No OpenSSL. Endian-independent.
 // Constants are stored as one base64 blob and decoded at first use.
@@ -764,6 +768,13 @@ inline std::string sha512(const std::string& data, uint64_t salt) {
 // <<< AUTO-SALT OVERLOAD <<<
 
 // ==================== MD5 ====================
+
+
+
+
+
+
+
 
 // ==================== MD5 ====================
 // ==================== MD5 ====================
@@ -1035,6 +1046,8 @@ inline void blake2b(const string& d,vector<uint8_t>& out){ out=_blake2b::hash_ra
 
 inline string blake2s(const string& d){ return blake2b(d).substr(0,64); }
 
+
+
 // ==================== ГОСТ Р 34.11-2012 (Стрибог) ====================
 // Self-contained Streebog-256/512 (GOST R 34.11-2012 / RFC 6986). No OpenSSL.
 // Verified against all four official RFC 6986 test vectors.
@@ -1259,6 +1272,15 @@ inline std::string stribog512(const void* data, size_t len) {
 }
 
 // ==================== AES-256 ====================
+
+
+
+
+
+
+
+
+
 
 // ==================== AES-256 ====================
 
@@ -2738,7 +2760,45 @@ public:
 #endif  // _WIN32
 } // namespace fs_
 
+// ==================== turbo.h (МАКРОСЫ ДЛЯ ПРОСТОТЫ) ====================
+namespace turbo_ {
+
+inline size_t cores() {
+    return max(1u, thread::hardware_concurrency());
+}
+
+template<typename F>
+inline void run(F&& func) {
+    size_t n = cores();
+    if (n <= 1) { func(); return; }
+    
+    vector<thread> threads;
+    for (size_t i = 0; i < n; i++)
+        threads.emplace_back(func);
+    for (auto& t : threads) t.join();
+}
+
+template<typename F>
+inline void repeat(size_t count, F&& func) {
+    size_t n = min(cores(), count);
+    size_t per = (count + n - 1) / n;
+    
+    vector<thread> threads;
+    for (size_t t = 0; t < n; t++) {
+        threads.emplace_back([=]() {
+            size_t start = t * per;
+            size_t end = min(start + per, count);
+            for (size_t i = start; i < end; i++) func();
+        });
+    }
+    for (auto& t : threads) t.join();
+}
+
+} // namespace turbo_
+
 // Макросы
+#define turbo(call)   turbo_::run([&]() { call; })
+#define turbo_r(n, call) turbo_::repeat(n, [&]() { call; })
 
 // ==================== PERLIN NOISE ====================
 namespace perlin_ {
