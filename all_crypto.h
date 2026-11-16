@@ -386,18 +386,10 @@ inline std::pair<BigNum, BigNum> divmod(const BigNum& a, const BigNum& b) {
 }
 
 // ─── Модуль ───
-inline BigNum mod(const BigNum& a, const BigNum& b) {
-    if (b.empty()) return BigNum();
-    if (lt(a, b)) return a;
-    BigNum r = a;
-    while (!lt(r, b)) {
-        r = sub(r, b);
-    }
-    return r;
-}
+inline BigNum mod(const BigNum& a, const BigNum& b) { if(b.empty()) return BigNum(); return divmod(a,b).second; }
 
 // ─── Модульное возведение в степень ───
-inline BigNum modpow(const BigNum& base, const BigNum& exp, const BigNum& mod) {
+inline BigNum modpow_ref(const BigNum& base, const BigNum& exp, const BigNum& mod) {
     if (zero(mod)) return BigNum();
     if (zero(exp)) return from_u64(1);
     BigNum result = from_u64(1);
@@ -416,6 +408,39 @@ inline BigNum modpow(const BigNum& base, const BigNum& exp, const BigNum& mod) {
     }
     return result;
 }
+// MODPOW-WINDOW4: окно 4 бита + таблица степеней
+static inline BigNum red(const BigNum& x, const BigNum& m){ return divmod(x,m).second; }
+static inline size_t bitlen(const BigNum& a){
+    if(a.empty()) return 0;
+    uint64_t top=a.back(); size_t b=64;
+    while(b && !((top>>(b-1))&1)) b--;
+    return (a.size()-1)*64 + b;
+}
+static inline unsigned digit4(const BigNum& k, size_t i){
+    size_t bit=4*i, limb=bit/64, off=bit%64;
+    if(limb>=k.size()) return 0;
+    return (unsigned)((k[limb]>>off)&15);
+}
+inline BigNum modpow(const BigNum& base, const BigNum& exp, const BigNum& mod){
+    if(zero(mod)) return BigNum();
+    if(zero(exp)) return from_u64(1);
+    BigNum b=red(base,mod);
+    BigNum T[16];
+    T[0]=from_u64(1); T[1]=b;
+    for(int i=2;i<16;i++) T[i]=red(mul(T[i-1],b),mod);
+    size_t n=bitlen(exp);
+    size_t top=(n+3)/4;
+    BigNum r=from_u64(1);
+    for(size_t i=top;i-->0;){
+        r=red(mul(r,r),mod); r=red(mul(r,r),mod);
+        r=red(mul(r,r),mod); r=red(mul(r,r),mod);
+        unsigned d=digit4(exp,i);
+        if(d) r=red(mul(r,T[d]),mod);
+    }
+    return r;
+}
+
+
 
 // ─── Модуль (с новым именем mod_big) ───
 inline BigNum mod_big(const BigNum& a, const BigNum& b) {
@@ -1161,7 +1186,7 @@ static inline void P(uint8_t* r, const uint8_t* a) {
     const Tables& t = tables();
     for (unsigned i = 0; i < 64; ++i) r[i] = a[t.TAU[i]];
 }
-static inline void L(uint8_t* r, const uint8_t* a) {
+static inline void l_ref(uint8_t* r, const uint8_t* a) {
     const Tables& t = tables();
     for (unsigned i = 0; i < 8; ++i) {
         uint64_t v = ld64(a + 8u * i), acc = 0;
@@ -1170,6 +1195,40 @@ static inline void L(uint8_t* r, const uint8_t* a) {
         st64(r + 8u * i, acc);
     }
 }
+// STRIBOG-TABLES-v3: таблицы из матрицы A напрямую (без l_slow, без ld64), самопроверка+откат
+static uint64_t LT[8][256];
+static bool lt_ready=false, lt_use=false;
+static void lt_build(){
+    const Tables& tb = tables();
+    for(int pp=0;pp<8;pp++) for(int v=0;v<256;v++){
+        uint64_t acc=0;
+        for(int bb=0;bb<8;bb++) if((v>>bb)&1) acc ^= tb.A[8*pp+7-bb];
+        LT[pp][v]=acc;
+    }
+    uint8_t in[64], r1[64], r2[64]; bool ok=true;
+    for(int tr=0; tr<4 && ok; tr++){
+        for(int i=0;i<64;i++) in[i]=(uint8_t)(i*37+tr*101+13);
+        l_ref(r1,in);
+        for(int row=0;row<8;row++){
+            uint64_t acc=0; for(int pp=0;pp<8;pp++) acc^=LT[pp][in[8*row+pp]];
+            for(int k=0;k<8;k++) r2[8*row+k]=(uint8_t)(acc>>(8*(7-k)));
+        }
+        for(int i=0;i<64;i++) if(r1[i]!=r2[i]){ok=false;break;}
+    }
+    lt_use=ok; lt_ready=true;
+}
+static inline void L(uint8_t* r, const uint8_t* a){
+    if(!lt_ready) lt_build();
+    if(!lt_use){ l_ref(r,a); return; }
+    for(int row=0;row<8;row++){
+        const uint8_t* s=a+8*row;
+        uint64_t acc=LT[0][s[0]]^LT[1][s[1]]^LT[2][s[2]]^LT[3][s[3]]^LT[4][s[4]]^LT[5][s[5]]^LT[6][s[6]]^LT[7][s[7]];
+        uint8_t* d=r+8*row;
+        d[0]=(uint8_t)(acc>>56); d[1]=(uint8_t)(acc>>48); d[2]=(uint8_t)(acc>>40); d[3]=(uint8_t)(acc>>32);
+        d[4]=(uint8_t)(acc>>24); d[5]=(uint8_t)(acc>>16); d[6]=(uint8_t)(acc>>8); d[7]=(uint8_t)acc;
+    }
+}
+
 static inline void LPS(uint8_t* r, const uint8_t* a) {
     uint8_t t[64], u[64];
     S(t, a); P(u, t); L(r, u);   // reads 'a' fully before writing 'r' -> in-place safe
@@ -1775,146 +1834,136 @@ namespace _rsa {
 // ==================== НАСТОЯЩИЙ Ed25519 (Curve25519) ====================
 namespace _ed25519 {
     using namespace _bigint;
-    
-    static const BigNum Q = sub(mul(from_u64(0x8000000000000000ULL), from_u64(0xFFFFFFFFFFFFFFFFULL)), from_u64(18));
+    static const BigNum Q = from_bytes(_::U("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
     static const BigNum D = from_bytes(_::U("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352"));
     static const BigNum L = from_bytes(_::U("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"));
     static const BigNum SQRT_M1 = from_bytes(_::U("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b"));
-
     struct Point { BigNum x, y; };
-    
-    inline Point base_point() { 
-        return { from_bytes(_::U("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0f24fb6a4cbd7f966")), 
-                 from_bytes(_::U("6666666666666666666666666666666666666666666666666666666666666666")) }; 
+    static inline BigNum F(const BigNum& v){ return mod_big(v, Q); }
+    static inline Point base_point(){
+        return { from_bytes(_::U("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921")),
+                 from_bytes(_::U("5866666666666666666666666666666666666666666666666666666666666666")) };
     }
-
-    inline Point point_add(const Point& P1, const Point& P2) {
+    static inline Point point_add(const Point& P1, const Point& P2){
+        BigNum x1y2=mul(P1.x,P2.y), y1x2=mul(P1.y,P2.x);
+        BigNum y1y2=mul(P1.y,P2.y), x1x2=mul(P1.x,P2.x);
+        BigNum t=F(mul(D,mul(x1x2,y1y2)));
+        BigNum one=from_u64(1);
+        BigNum p1=add(one,t), p2=sub(one,t);
+        BigNum inv=modinv(F(mul(p1,p2)),Q);      // одна инверсия вместо двух
         Point R;
-        BigNum x1y2 = mul(P1.x, P2.y), y1x2 = mul(P1.y, P2.x);
-        BigNum y1y2 = mul(P1.y, P2.y), x1x2 = mul(P1.x, P2.x);
-        BigNum d_x1x2_y1y2 = mod(mul(D, mul(x1x2, y1y2)), Q);
-        BigNum inv1 = modinv(add(from_u64(1), d_x1x2_y1y2), Q);
-        BigNum inv2 = modinv(sub(from_u64(1), d_x1x2_y1y2), Q);
-        R.x = mod(mul(add(x1y2, y1x2), inv1), Q);
-        R.y = mod(mul(add(y1y2, x1x2), inv2), Q);
+        R.x=F(mul(add(x1y2,y1x2), F(mul(inv,p2))));
+        R.y=F(mul(add(y1y2,x1x2), F(mul(inv,p1))));
         return R;
     }
-
-    inline Point scalar_mult(Point P, const BigNum& k) {
-        Point R = { from_u64(0), from_u64(1) };
-        BigNum kk = k;
-        while (!zero(kk)) {
-            if (kk[0] & 1) R = point_add(R, P);
-            P = point_add(P, P);
-            for (size_t i = 0; i < kk.size(); ++i) {
-                kk[i] >>= 1;
-                if (i + 1 < kk.size() && (kk[i+1] & 1)) kk[i] |= 0x8000000000000000ULL;
-            }
-            while (!kk.empty() && kk.back() == 0) kk.pop_back();
+    
+    // ── BASE-TABLE-V2: окно 4 бита, gT[i*16+j]=j*16^i*B (как ge_scalarmult_base) ──
+    static std::vector<Point> gT;
+    static bool gT_ready=false;
+    static void build_base_table(){
+        gT.assign(64*16, Point{from_u64(0),from_u64(1)});
+        Point B=base_point();
+        Point acc={from_u64(0),from_u64(1)};
+        for(int j=0;j<16;j++){ gT[j]=acc; acc=point_add(acc,B); }
+        for(int i=1;i<64;i++){
+            Point bi=gT[(i-1)*16+1];
+            for(int d=0;d<4;d++) bi=point_add(bi,bi);      // bi *= 16
+            Point acc2={from_u64(0),from_u64(1)};
+            for(int j=0;j<16;j++){ gT[i*16+j]=acc2; acc2=point_add(acc2,bi); }
+        }
+        gT_ready=true;
+    }
+    static inline unsigned digit4(const BigNum& k, int i){   // биты [4i..4i+3], без изменения k
+        size_t bit=(size_t)4*i, limb=bit/64, off=bit%64;
+        if(limb>=k.size()) return 0;
+        return (unsigned)((k[limb]>>off)&15);                // off<=60, 4 бита влезают в лимб
+    }
+    static inline Point scalar_mult_base(const BigNum& k){
+        if(!gT_ready) build_base_table();
+        Point R={from_u64(0),from_u64(1)};
+        for(int i=0;i<64;i++){                                // ровно 64 итерации, всегда
+            unsigned d=digit4(k,i);
+            if(d) R=point_add(R,gT[i*16+d]);
         }
         return R;
     }
-
-    inline Point decompress(const vector<uint8_t>& b) {
-        if (b.size() != 32) return {from_u64(0), from_u64(0)};
-        BigNum y = from_bytes(b);
-        y[0] &= ~(1ULL << 63);
-        bool sign = (b[31] & 0x80) != 0;
-        
-        BigNum y2 = mod(mul(y, y), Q);
-        BigNum u = sub(y2, from_u64(1));
-        BigNum v = add(mul(D, y2), from_u64(1));
-        
-        BigNum v3 = mod(mul(mul(v, v), v), Q);
-        BigNum v7 = mod(mul(mul(v3, v3), v), Q);
-        BigNum uv7 = mod(mul(u, v7), Q);
-
-        BigNum exp = divmod(sub(Q, from_u64(5)), from_u64(8)).first;
-        
-        BigNum x = mod(mul(mul(u, v3), modpow(uv7, exp, Q)), Q);
-        
-        if (!eq(mod(mul(v, mul(x, x)), Q), mod(u, Q))) {
-            x = mod(mul(x, SQRT_M1), Q);
+static inline Point scalar_mult(Point P, const BigNum& k){
+        Point R={from_u64(0),from_u64(1)}; BigNum kk=k;
+        while(!zero(kk)){
+            if(kk[0]&1) R=point_add(R,P);
+            P=point_add(P,P);
+            for(size_t i=0;i<kk.size();++i){ kk[i]>>=1; if(i+1<kk.size()&&(kk[i+1]&1)) kk[i]|=0x8000000000000000ULL; }
+            while(!kk.empty()&&kk.back()==0) kk.pop_back();
         }
-        
-        bool x_is_odd = (x[0] & 1);
-        if (x_is_odd != sign) x = sub(Q, x);
-        
-        return {x, y};
+        return R;
     }
-
-    inline vector<uint8_t> sign(const vector<uint8_t>& msg, const vector<uint8_t>& priv) {
-        vector<uint8_t> h = _sha512::hash_raw(priv);
-        vector<uint8_t> a(h.begin(), h.begin() + 32);
-        a[0] &= 248; a[31] &= 127; a[31] |= 64;
-        BigNum a_num = from_bytes(a);
-
-        Point A = scalar_mult(base_point(), a_num);
-        vector<uint8_t> A_bytes = to_bytes(A.y);
-        A_bytes.resize(32, 0);
-        if (A.x[0] & 1) A_bytes[31] |= 0x80;
-
-        vector<uint8_t> prefix(h.begin() + 32, h.end());
-        prefix.insert(prefix.end(), msg.begin(), msg.end());
-        BigNum r = mod(from_bytes(_sha512::hash_raw(prefix)), L);
-
-        Point R = scalar_mult(base_point(), r);
-        vector<uint8_t> R_bytes = to_bytes(R.y);
-        R_bytes.resize(32, 0);
-        if (R.x[0] & 1) R_bytes[31] |= 0x80;
-
-        vector<uint8_t> k_input = R_bytes;
-        k_input.insert(k_input.end(), A_bytes.begin(), A_bytes.end());
-        k_input.insert(k_input.end(), msg.begin(), msg.end());
-        BigNum k = mod(from_bytes(_sha512::hash_raw(k_input)), L);
-
-        BigNum S = mod(add(r, mul(k, a_num)), L);
-        vector<uint8_t> sig = R_bytes;
-        vector<uint8_t> S_bytes = to_bytes(S);
-        S_bytes.resize(32, 0);
-        sig.insert(sig.end(), S_bytes.begin(), S_bytes.end());
+    static inline vector<uint8_t> enc(const Point& P){
+        vector<uint8_t> b=to_bytes(P.y); b.resize(32,0);
+        if(!P.x.empty()&&(P.x[0]&1)) b[31]|=0x80;
+        return b;
+    }
+    static inline Point decompress(const vector<uint8_t>& b){
+        if(b.size()!=32) return {from_u64(0),from_u64(0)};
+        BigNum y=from_bytes(b);
+        bool sign=(b[31]&0x80)!=0;
+        y[3] &= ~(1ULL<<63);                      // sign-бит в старшем лимбе
+        y=F(y);
+        BigNum y2=F(mul(y,y));
+        BigNum u=sub(y2,from_u64(1));
+        BigNum v=add(F(mul(D,y2)),from_u64(1));
+        BigNum v3=F(mul(mul(v,v),v));
+        BigNum v7=F(mul(mul(v3,v3),v));
+        BigNum uv7=F(mul(u,v7));
+        BigNum exp=divmod(sub(Q,from_u64(5)),from_u64(8)).first;
+        BigNum x=F(mul(mul(u,v3), modpow(uv7,exp,Q)));
+        if(!eq(F(mul(v,mul(x,x))), F(u))) x=F(mul(x,SQRT_M1));
+        if((x[0]&1)!=sign) x=sub(Q,x);
+        return {x,y};
+    }
+    static inline vector<uint8_t> sign(const vector<uint8_t>& msg, const vector<uint8_t>& priv){
+        vector<uint8_t> h=_sha512::hash_raw(priv);
+        vector<uint8_t> a(h.begin(),h.begin()+32);
+        a[0]&=248; a[31]&=127; a[31]|=64;
+        BigNum a_num=from_bytes(a);
+        vector<uint8_t> A_bytes=enc(scalar_mult_base(a_num));
+        vector<uint8_t> prefix(h.begin()+32,h.end());
+        prefix.insert(prefix.end(),msg.begin(),msg.end());
+        BigNum r=mod_big(from_bytes(_sha512::hash_raw(prefix)),L);
+        vector<uint8_t> R_bytes=enc(scalar_mult_base(r));
+        vector<uint8_t> ki=R_bytes;
+        ki.insert(ki.end(),A_bytes.begin(),A_bytes.end());
+        ki.insert(ki.end(),msg.begin(),msg.end());
+        BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
+        BigNum S=mod_big(add(r,mul(k,a_num)),L);
+        vector<uint8_t> sig=R_bytes;
+        vector<uint8_t> Sb=to_bytes(S); Sb.resize(32,0);
+        sig.insert(sig.end(),Sb.begin(),Sb.end());
         return sig;
     }
-
-    inline bool verify(const vector<uint8_t>& msg, const vector<uint8_t>& sig, const vector<uint8_t>& pub) {
-        if (sig.size() != 64 || pub.size() != 32) return false;
-        vector<uint8_t> R_bytes(sig.begin(), sig.begin() + 32);
-        vector<uint8_t> S_bytes(sig.begin() + 32, sig.end());
-        BigNum S = from_bytes(S_bytes);
-
-        Point R = decompress(R_bytes);
-        Point A = decompress(pub);
-        if (zero(A.y) || zero(R.y)) return false;
-
-        vector<uint8_t> k_input = R_bytes;
-        k_input.insert(k_input.end(), pub.begin(), pub.end());
-        k_input.insert(k_input.end(), msg.begin(), msg.end());
-        BigNum k = mod(from_bytes(_sha512::hash_raw(k_input)), L);
-
-        Point S_B = scalar_mult(base_point(), S);
-        Point k_A = scalar_mult(A, k);
-        Point R_plus_kA = point_add(R, k_A);
-
-        return eq(S_B.x, R_plus_kA.x) && eq(S_B.y, R_plus_kA.y);
+    static inline bool verify(const vector<uint8_t>& msg, const vector<uint8_t>& sig, const vector<uint8_t>& pub){
+        if(sig.size()!=64||pub.size()!=32) return false;
+        vector<uint8_t> Rb(sig.begin(),sig.begin()+32), Sb(sig.begin()+32,sig.end());
+        BigNum S=from_bytes(Sb);
+        Point R=decompress(Rb), A=decompress(pub);
+        if(zero(A.y)||zero(R.y)) return false;
+        vector<uint8_t> ki=Rb;
+        ki.insert(ki.end(),pub.begin(),pub.end());
+        ki.insert(ki.end(),msg.begin(),msg.end());
+        BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
+        Point S_B=scalar_mult_base(S);
+        Point k_A=scalar_mult(A,k);
+        Point Rp=point_add(R,k_A);
+        return eq(S_B.x,Rp.x)&&eq(S_B.y,Rp.y);
     }
-
-    struct KeyPair {
-        vector<uint8_t> pub;
-        vector<uint8_t> priv;
-    };
-    
-    inline KeyPair keygen() {
+    struct KeyPair { vector<uint8_t> pub, priv; };
+    static inline KeyPair keygen(){
         KeyPair kp;
-        vector<uint8_t> seed = rand_::bytes(32);
-        vector<uint8_t> h = _sha512::hash_raw(seed);
-        vector<uint8_t> a(h.begin(), h.begin() + 32);
-        a[0] &= 248; a[31] &= 127; a[31] |= 64;
-        kp.priv = a;
-        BigNum a_num = from_bytes(a);
-        Point A = scalar_mult(base_point(), a_num);
-        kp.pub = to_bytes(A.y);
-        kp.pub.resize(32, 0);
-        if (A.x[0] & 1) kp.pub[31] |= 0x80;
+        vector<uint8_t> seed=rand_::bytes(32);
+        vector<uint8_t> h=_sha512::hash_raw(seed);
+        vector<uint8_t> a(h.begin(),h.begin()+32);
+        a[0]&=248; a[31]&=127; a[31]|=64;
+        kp.priv=seed;                              // priv = SEED, согласовано с sign
+        kp.pub=enc(scalar_mult_base(from_bytes(a)));
         return kp;
     }
 } // namespace _ed25519
