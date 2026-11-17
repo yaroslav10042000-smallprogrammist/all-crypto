@@ -1012,56 +1012,62 @@ inline void sha3_512(const string& d,vector<uint8_t>& out){ out=_sha3::hash_raw(
 
 // ==================== BLAKE2b ====================
 namespace _blake2b {
-    static const uint64_t IV[8]={
-        0x6a09e667f3bcc908,0xbb67ae8584caa73b,0x3c6ef372fe94f82b,0xa54ff53a5f1d36f1,
-        0x510e527fade682d1,0x9b05688c2b3e6c1f,0x1f83d9abfb41bd6b,0x5be0cd19137e2179
-    };
-    static const uint8_t SIGMA[12][16]={
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},{14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
-        {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},{7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
-        {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},{2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
-        {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},{13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
-        {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},{10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
-        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},{14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}
-    };
-    inline uint64_t ROR(uint64_t x,int n){return (x>>n)|(x<<(64-n));}
-    inline void G(uint64_t& a,uint64_t& b,uint64_t& c,uint64_t& d,uint64_t x,uint64_t y){
-        a=a+b+x; d=ROR(d^a,32); c=c+d; b=ROR(b^c,24);
-        a=a+b+y; d=ROR(d^a,16); c=c+d; b=ROR(b^c,63);
+    static const uint64_t IV[8]={0x6a09e667f3bcc908ULL,0xbb67ae8584caa73bULL,0x3c6ef372fe94f82bULL,0xa54ff53a5f1d36f1ULL,0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL};
+    static const uint8_t SIGMA[10][16]={
+        {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
+        {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
+        {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},
+        {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
+        {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},
+        {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
+        {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},
+        {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
+        {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},
+        {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0}};
+    static inline uint64_t rotr(uint64_t x,int n){return (x>>n)|(x<<(64-n));}
+    static inline uint64_t ld64le(const uint8_t* p){uint64_t v=0;for(int i=7;i>=0;i--)v=(v<<8)|p[i];return v;}
+    static inline void G(uint64_t* v,int a,int b,int c,int d,uint64_t x,uint64_t y){
+        v[a]+=v[b]+x; v[d]=rotr(v[d]^v[a],32); v[c]+=v[d]; v[b]=rotr(v[b]^v[c],24);
+        v[a]+=v[b]+y; v[d]=rotr(v[d]^v[a],16); v[c]+=v[d]; v[b]=rotr(v[b]^v[c],63);
     }
-    inline vector<uint8_t> hash_raw(const vector<uint8_t>& data,size_t outlen=64){
-        uint64_t h[8]; memcpy(h,IV,sizeof(IV));
-        h[0]^=0x01010000^(outlen<<0);
-        const uint8_t* src_=data.data(); size_t n_=data.size();   // NOCOPY-ALL
-    size_t full_=n_-n_%(128);
-    vector<uint8_t> tail_(src_+full_, src_+n_);
-
-        size_t dlen=n_;
-        if(!tail_.empty()) tail_.resize(128,0);
-        uint64_t t0=0,t1=0;
-            size_t total_=full_+tail_.size();
-    auto at_=[&](size_t i)->uint8_t{ return i<full_? src_[i] : tail_[i-full_]; };
-    auto ptr_=[&](size_t i)->const uint8_t*{ return i<full_? src_+i : tail_.data()+(i-full_); };
-for(size_t i=0;i<total_;i+=128){
-            t0+=128; if(t0<128) t1++;
-            uint64_t v[16]; memcpy(v,h,64); for(int j=0;j<8;j++) v[j+8]=IV[j];
-            v[12]^=t0; v[13]^=t1;
-            uint64_t m[16];
-            for(int j=0;j<16;j++) m[j]=((uint64_t*)ptr_(i))[j];
-            for(int r=0;r<12;r++){
-                G(v[0],v[4],v[8],v[12],m[SIGMA[r][0]],m[SIGMA[r][1]]);
-                G(v[1],v[5],v[9],v[13],m[SIGMA[r][2]],m[SIGMA[r][3]]);
-                G(v[2],v[6],v[10],v[14],m[SIGMA[r][4]],m[SIGMA[r][5]]);
-                G(v[3],v[7],v[11],v[15],m[SIGMA[r][6]],m[SIGMA[r][7]]);
-                G(v[0],v[5],v[10],v[15],m[SIGMA[r][8]],m[SIGMA[r][9]]);
-                G(v[1],v[6],v[11],v[12],m[SIGMA[r][10]],m[SIGMA[r][11]]);
-                G(v[2],v[7],v[8],v[13],m[SIGMA[r][12]],m[SIGMA[r][13]]);
-                G(v[3],v[4],v[9],v[14],m[SIGMA[r][14]],m[SIGMA[r][15]]);
-            }
-            for(int j=0;j<8;j++) h[j]^=v[j]^v[j+8];
+    static void compress(uint64_t h[8],const uint8_t blk[128],uint64_t t0,uint64_t f0){
+        uint64_t v[16],m[16];
+        for(int i=0;i<8;i++)v[i]=h[i];
+        for(int i=0;i<8;i++)v[8+i]=IV[i];
+        v[12]^=t0; v[14]^=f0;
+        for(int i=0;i<16;i++)m[i]=ld64le(blk+8*i);
+        for(int r=0;r<12;r++){
+            const uint8_t* s=SIGMA[r%10];
+            G(v,0,4,8,12,m[s[0]],m[s[1]]); G(v,1,5,9,13,m[s[2]],m[s[3]]);
+            G(v,2,6,10,14,m[s[4]],m[s[5]]); G(v,3,7,11,15,m[s[6]],m[s[7]]);
+            G(v,0,5,10,15,m[s[8]],m[s[9]]); G(v,1,6,11,12,m[s[10]],m[s[11]]);
+            G(v,2,7,8,13,m[s[12]],m[s[13]]); G(v,3,4,9,14,m[s[14]],m[s[15]]);
         }
-        return {(uint8_t*)h,(uint8_t*)h+outlen};
+        for(int i=0;i<8;i++)h[i]^=v[i]^v[i+8];
     }
+    static inline std::vector<uint8_t> hash(const std::vector<uint8_t>& data,size_t outlen=64,const std::vector<uint8_t>& key={}){
+        uint64_t h[8]; for(int i=0;i<8;i++)h[i]=IV[i];
+        h[0]^=0x01010000ULL ^ ((uint64_t)key.size()<<8) ^ (uint64_t)outlen;
+        std::vector<uint8_t> full;
+        if(!key.empty()){ full.assign(128,0); memcpy(full.data(),key.data(),key.size()); }
+        full.insert(full.end(),data.begin(),data.end());
+        if(full.empty()){ uint8_t blk[128]={0}; compress(h,blk,0,~0ULL); }
+        else{
+            size_t off=0; uint64_t t=0;
+            while(off<full.size()){
+                size_t take=std::min((size_t)128,full.size()-off);
+                uint8_t blk[128]={0}; memcpy(blk,full.data()+off,take);
+                t+=take;
+                bool last=(off+take>=full.size());
+                compress(h,blk,t,last?~0ULL:0);
+                off+=take;
+            }
+        }
+        std::vector<uint8_t> out(outlen);
+        for(size_t i=0;i<outlen;i++)out[i]=(uint8_t)(h[i/8]>>(8*(i%8)));
+        return out;
+    }
+    static inline std::vector<uint8_t> hash_raw(const std::vector<uint8_t>& d){ return hash(d,64); }
 }
 
 inline string blake2b(const vector<uint8_t>& d){ return _::H(_blake2b::hash_raw(d)); }
@@ -1536,7 +1542,54 @@ namespace _aes {
     }
 }
 // ─── AES публичные обёртки ───
+
+
+
+
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+// NEON-CLEAN: аппаратный AES-CBC encrypt (корректная формула ARM)
+#include <arm_neon.h>
+static inline void neon_cbc_enc(uint8_t* o,const uint8_t* in,size_t n,const uint8_t* k,const uint8_t* iv){
+    uint8_t rk[240]; _aes::KeyExpansion(k,rk);
+    uint8x16_t kk[15];
+    for(int q=0;q<15;q++)kk[q]=vld1q_u8(rk+q*16);
+    const uint8x16_t zero=vdupq_n_u8(0);
+    uint8x16_t p=vld1q_u8(iv);
+    for(size_t q=0;q<n/16;q++){
+        uint8x16_t s=veorq_u8(vld1q_u8(in+q*16),p);
+        s=veorq_u8(s,kk[0]);
+        for(int r=1;r<14;r++){
+            s=vaeseq_u8(s,zero);   // SubBytes+ShiftRows
+            s=vaesmcq_u8(s);       // MixColumns
+            s=veorq_u8(s,kk[r]);   // AddRoundKey
+        }
+        s=vaeseq_u8(s,zero);
+        s=veorq_u8(s,kk[14]);
+        vst1q_u8(o+q*16,s); p=s;
+    }
+}
+static inline void neon_block_enc(uint8_t* out,const uint8_t* in,const uint8_t* rk){
+    uint8x16_t kk[15];
+    for(int q=0;q<15;q++)kk[q]=vld1q_u8(rk+q*16);
+    const uint8x16_t zero=vdupq_n_u8(0);
+    uint8x16_t s=vld1q_u8(in);
+    s=veorq_u8(s,kk[0]);
+    for(int r=1;r<14;r++){ s=vaeseq_u8(s,zero); s=vaesmcq_u8(s); s=veorq_u8(s,kk[r]); }
+    s=vaeseq_u8(s,zero); s=veorq_u8(s,kk[14]);
+    vst1q_u8(out,s);
+}
+#endif
 inline vector<uint8_t> aes256_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& iv){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    if(plain.size()%16==0 && iv.size()==16 && key.size()==32){
+        vector<uint8_t> out(plain.size());
+        neon_cbc_enc(out.data(),plain.data(),plain.size(),key.data(),iv.data());
+        return out;
+    }
+#endif
+
+
     return _aes::encrypt_raw(plain,key,iv);
 }
 inline vector<uint8_t> aes256_encrypt(const string& plain,const string& key,const string& iv){
@@ -1600,7 +1653,11 @@ inline vector<uint8_t> aes256_gcm_encrypt(const vector<uint8_t>& plain,const vec
     vector<uint8_t> cipher;
     uint8_t keystream[16];
     for(size_t i=0;i<plain.size();i+=16){
+        #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+        neon_block_enc(keystream,ctr.data(),rk.data());
+#else
         memcpy(keystream,ctr.data(),16); _aes::Cipher(keystream,rk.data());
+#endif
         size_t sz=min((size_t)16,plain.size()-i);
         for(size_t j=0;j<sz;j++) cipher.push_back(plain[i+j]^keystream[j]);
         _gcm::inc32(ctr);
@@ -1628,7 +1685,11 @@ inline bool aes256_gcm_decrypt(const vector<uint8_t>& packed,const vector<uint8_
     vector<uint8_t> ctr=iv; ctr.push_back(0);ctr.push_back(0);ctr.push_back(0);ctr.push_back(1);
     plain.clear();
     for(size_t i=0;i<cipher.size();i+=16){
+        #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+        neon_block_enc(keystream,ctr.data(),rk.data());
+#else
         memcpy(keystream,ctr.data(),16); _aes::Cipher(keystream,rk.data());
+#endif
         size_t sz=min((size_t)16,cipher.size()-i);
         for(size_t j=0;j<sz;j++) plain.push_back(cipher[i+j]^keystream[j]);
         _gcm::inc32(ctr);
@@ -1672,6 +1733,7 @@ namespace _chacha {
 }
 
 inline vector<uint8_t> chacha20_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& nonce){
+
     return _chacha::crypt_raw(plain,key,nonce);
 }
 inline vector<uint8_t> chacha20_decrypt(const vector<uint8_t>& cipher,const vector<uint8_t>& key,const vector<uint8_t>& nonce){
