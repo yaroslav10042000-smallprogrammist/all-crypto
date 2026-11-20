@@ -1,4 +1,13 @@
 #pragma once
+#if defined(__has_include)
+#  if __has_include(<sys/random.h>)
+#    include <sys/random.h>
+#    define AC_HAVE_GETENTROPY 1
+#  endif
+#endif
+#if defined(__aarch64__) && (defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO))
+#include <arm_neon.h>
+#endif
 // ===================================================================
 // all_crypto.h
 // Современная криптография + legacy. Один файл.
@@ -58,6 +67,29 @@ template<> inline vector<uint8_t> bytes<vector<uint8_t>>(const vector<uint8_t>& 
 inline mt19937_64& rng() { static mt19937_64 g(random_device{}()); return g; }
 inline vector<uint8_t> randb(size_t n) { vector<uint8_t> r(n); for(auto&b:r) b=(uint8_t)(rng()()&0xFF); return r; }
 inline uint64_t rand64() { return rng()(); }
+// Криптостойкая энтропия ОС: getentropy -> /dev/urandom -> random_device.
+// Только для секретов: ключи, IV, nonce, соли.
+inline bool csrandb_into(uint8_t* p,size_t n){
+#ifdef AC_HAVE_GETENTROPY
+    while(n){
+        size_t take = n>256 ? 256 : n;
+        if(getentropy(p,take)!=0) break;
+        p+=take; n-=take;
+    }
+    if(n==0) return true;
+#endif
+    { std::ifstream f("/dev/urandom", std::ios::binary);
+      if(f){ f.read((char*)p,(std::streamsize)n); if((size_t)f.gcount()==n) return true; } }
+    { std::random_device rd;
+      for(size_t i=0;i<n;i++) p[i]=(uint8_t)(rd()&0xFFu); }
+    return true;
+}
+inline vector<uint8_t> csrandb(size_t n){
+    vector<uint8_t> r(n);
+    if(n) csrandb_into(r.data(),n);
+    return r;
+}
+
 
 } // namespace _
 
@@ -86,16 +118,15 @@ inline uint64_t _xorshift128p(uint64_t s[2]) {
 }
 
 inline uint64_t u64() {
-    static uint64_t s[2] = {0, 0};
-    static bool init = false;
-    if (!init) {
-        random_device rd;
-        s[0] = (uint64_t(rd()) << 32) | rd();
-        s[1] = (uint64_t(rd()) << 32) | rd();
-        if (s[0] == 0 && s[1] == 0) { s[0] = 1; s[1] = 1; }
-        init = true;
-    }
-    return _xorshift128p(s);
+static uint64_t s[2] = {0, 0};
+static bool init = false;
+if (!init) {
+    auto sb=_::csrandb(16);
+    memcpy(&s[0],sb.data(),8); memcpy(&s[1],sb.data()+8,8);
+    if (s[0]==0 && s[1]==0) { s[0]=1; s[1]=1; }
+    init = true;
+}
+return _xorshift128p(s);
 }
 
 inline uint64_t range(uint64_t min, uint64_t max) {
@@ -125,7 +156,11 @@ inline vector<uint8_t> u256() { return bytes(32); }
 inline vector<uint8_t> u512() { return bytes(64); }
 inline vector<uint8_t> u_any(size_t n) { return bytes(n); }
 
-inline uint64_t salt() { return u64() & 0x7FFFFFFFFFFFFFFFULL; }
+inline uint64_t salt() {
+auto b=_::csrandb(8); uint64_t v=0;
+for(int i=0;i<8;i++) v|=((uint64_t)b[i]<<(8*i));
+return v & 0x7FFFFFFFFFFFFFFFULL;
+}
 
 inline string str(size_t len) {
     static const char C[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -246,33 +281,41 @@ inline bool zero(const BigNum& n) { return n.empty(); }
 
 // ─── Сложение ───
 inline BigNum add(const BigNum& a, const BigNum& b) {
-    BigNum r;
-    size_t sz = max(a.size(), b.size());
-    r.reserve(sz + 1);
-    uint64_t carry = 0;
-    for (size_t i = 0; i < sz; ++i) {
-        uint64_t sum = carry;
-        if (i < a.size()) sum += a[i];
-        if (i < b.size()) sum += b[i];
-        r.push_back(sum);
-        carry = (sum < carry) ? 1 : 0;
-    }
-    if (carry) r.push_back(1);
-    while (!r.empty() && r.back() == 0) r.pop_back();
-    return r;
+BigNum r;
+size_t sz = max(a.size(), b.size());
+r.reserve(sz + 1);
+uint64_t carry = 0;
+for (size_t i = 0; i < sz; ++i) {
+    uint64_t ai = (i < a.size()) ? a[i] : 0;
+    uint64_t bi = (i < b.size()) ? b[i] : 0;
+    uint64_t s1 = ai + bi;
+    uint64_t c1 = (s1 < ai) ? 1u : 0u;
+    uint64_t s2 = s1 + carry;
+    uint64_t c2 = (s2 < s1) ? 1u : 0u;
+    r.push_back(s2);
+    carry = c1 + c2;
+}
+if (carry) r.push_back(carry);
+while (!r.empty() && r.back() == 0) r.pop_back();
+return r;
 }
 
 // ─── Вычитание ───
 inline BigNum sub(const BigNum& a, const BigNum& b) {
-    BigNum r = a;
-    uint64_t borrow = 0;
-    for (size_t i = 0; i < r.size(); ++i) {
-        uint64_t s = borrow + (i < b.size() ? b[i] : 0);
-        borrow = (r[i] < s) ? 1 : 0;
-        r[i] -= s;
-    }
-    while (!r.empty() && r.back() == 0) r.pop_back();
-    return r;
+BigNum r = a;
+uint64_t borrow = 0;
+for (size_t i = 0; i < r.size(); ++i) {
+    uint64_t bi = (i < b.size()) ? b[i] : 0;
+    uint64_t old = r[i];
+    uint64_t t1 = old - bi;
+    uint64_t nb = (old < bi) ? 1u : 0u;
+    uint64_t t2 = t1 - borrow;
+    nb += (t1 < borrow) ? 1u : 0u;
+    r[i] = t2;
+    borrow = nb;
+}
+while (!r.empty() && r.back() == 0) r.pop_back();
+return r;
 }
 
 // ─── Умножение ───
@@ -282,107 +325,79 @@ inline BigNum mul(const BigNum& a, const BigNum& b) {
     for (size_t i = 0; i < a.size(); ++i) {
         uint64_t carry = 0;
         for (size_t j = 0; j < b.size(); ++j) {
-            __uint128_t prod = (__uint128_t)a[i] * b[j] + r[i + j] + carry;
-            r[i + j] = (uint64_t)prod;
-            carry = (uint64_t)(prod >> 64);
+            __uint128_t cur = (__uint128_t)a[i]*b[j] + r[i+j] + carry;
+            r[i+j]=(uint64_t)cur; carry=(uint64_t)(cur>>64);
         }
-        if (carry) r[i + b.size()] += carry;
+        size_t k=i+b.size();
+        while(carry && k<r.size()){
+            __uint128_t cur=(__uint128_t)r[k]+carry;
+            r[k]=(uint64_t)cur; carry=(uint64_t)(cur>>64); ++k;
+        }
     }
-    while (!r.empty() && r.back() == 0) r.pop_back();
+    while(!r.empty()&&r.back()==0) r.pop_back();
     return r;
 }
     
        // ─── Деление с остатком (Knuth, без гибрида) ───
 inline std::pair<BigNum, BigNum> divmod(const BigNum& a, const BigNum& b) {
-    if (b.empty() || b.size() == 0) return {BigNum(), BigNum()};
-    if (a.size() < b.size()) return {BigNum(), a};
-
-    // Случай деления на одно слово (быстрый путь)
-    if (b.size() == 1) {
-        BigNum r = a;
-        uint64_t divisor = b[0];
-        uint64_t carry = 0;
-        for (size_t i = a.size(); i-- > 0;) {
-            __uint128_t v = (__uint128_t(carry) << 64) + a[i];
-            r[i] = v / divisor;
-            carry = v % divisor;
+    if (b.empty()) return {BigNum(), BigNum()};
+    BigNum A=a, B=b;
+    while(!A.empty()&&A.back()==0) A.pop_back();
+    while(!B.empty()&&B.back()==0) B.pop_back();
+    if(B.empty()) return {BigNum(), BigNum()};
+    if(cmp(A,B)<0) return {BigNum(), A};
+    if(B.size()==1){
+        uint64_t d=B[0], carry=0; BigNum q(A.size());
+        for(size_t i=A.size(); i-->0;){
+            __uint128_t cur=((__uint128_t)carry<<64)|A[i];
+            q[i]=(uint64_t)(cur/d); carry=(uint64_t)(cur%d);
         }
-        while (r.size() > 1 && r.back() == 0) r.pop_back();
-        BigNum rem;
-        if (carry) rem.push_back(carry);
-        return {r, rem};
+        while(!q.empty()&&q.back()==0) q.pop_back();
+        BigNum r; if(carry) r.push_back(carry);
+        return {q,r};
     }
-
-    // Нормализация
-    BigNum divisor = b;
-    size_t n = divisor.size();
-    size_t m = a.size() - n;
-    BigNum dividend = a;
-    uint64_t shift = 0;
-    uint64_t top = divisor.back();
-    if (top < (1ULL << 63)) {
-        shift = __builtin_clzll(top);
-        divisor = mul(divisor, from_u64(1ULL << shift));
-        dividend = mul(dividend, from_u64(1ULL << shift));
-        while (!dividend.empty() && dividend.back() == 0) dividend.pop_back();
-        if (dividend.size() < a.size() + 1) dividend.push_back(0);
-    }
-
-    BigNum q(m + 1, 0);
-    BigNum r = dividend;
-    r.push_back(0);
-
-    for (size_t j = m + 1; j-- > 0;) {
-        uint64_t r_top = (j + n < r.size()) ? r[j + n] : 0;
-        uint64_t r_second = (j + n - 1 < r.size()) ? r[j + n - 1] : 0;
-        uint64_t divisor_top = divisor.back();
-
-        __uint128_t q_hat = (__uint128_t(r_top) << 64) + r_second;
-        if (divisor_top == 0) q_hat = 0;
-        else q_hat /= divisor_top;
-        if (q_hat >> 64) q_hat = ~(__uint128_t)0;
-
-        uint64_t borrow = 0;
-        for (size_t i = 0; i < n; ++i) {
-            __uint128_t sub = q_hat * divisor[i] + borrow;
-            uint64_t sub_lo = (uint64_t)sub;
-            borrow = (sub >> 64);
-            if (r[j + i] < sub_lo) {
-                r[j + i] = r[j + i] - sub_lo;
-                borrow++;
-            } else {
-                r[j + i] -= sub_lo;
-            }
+    size_t n=B.size(), m=A.size()-n;
+    uint64_t sh=__builtin_clzll(B[n-1]);
+    BigNum v(n,0);
+    { uint64_t c=0; for(size_t i=0;i<n;i++){ __uint128_t cur=((__uint128_t)B[i]<<sh)|c; v[i]=(uint64_t)cur; c=(uint64_t)(cur>>64);} }
+    BigNum u(m+n+1,0);
+    { uint64_t c=0; for(size_t i=0;i<A.size();i++){ __uint128_t cur=((__uint128_t)A[i]<<sh)|c; u[i]=(uint64_t)cur; c=(uint64_t)(cur>>64);} u[A.size()]=c; }
+    BigNum q(m+1,0);
+    for(size_t jj=m+1; jj-->0;){
+        size_t j=jj;
+        __uint128_t numer=((__uint128_t)u[j+n]<<64)|u[j+n-1];
+        uint64_t qhat=(uint64_t)(numer/v[n-1]);
+        __uint128_t rhat=(__uint128_t)(numer%v[n-1]);
+        while(qhat!=0){
+            __uint128_t lhs=(__uint128_t)qhat*v[n-2];
+            __uint128_t rhs=(rhat<<64)|u[j+n-2];
+            if(lhs<=rhs) break;
+            qhat--; rhat+=(__uint128_t)v[n-1];
+            if(rhat>((__uint128_t)1<<64)-1) break;
         }
-        if (r[j + n] < borrow) {
-            r[j + n] = r[j + n] - borrow;
-            borrow = 1;
-        } else {
-            r[j + n] -= borrow;
-            borrow = 0;
+        uint64_t borrow=0;
+        for(size_t i=0;i<n;i++){
+            __uint128_t prod=(__uint128_t)qhat*v[i]+borrow;
+            __uint128_t cur=(__uint128_t)u[j+i]-(uint64_t)prod;
+            u[j+i]=(uint64_t)cur;
+            borrow=(uint64_t)(prod>>64)+((cur>>(64))?1:0);
         }
-
-        q[j] = (uint64_t)q_hat;
-        if (borrow) {
-            q[j]--;
-            uint64_t carry = 0;
-            for (size_t i = 0; i < n; ++i) {
-                uint64_t sum = r[j + i] + divisor[i] + carry;
-                carry = (sum < r[j + i]) ? 1 : 0;
-                r[j + i] = sum;
-            }
-            r[j + n] += carry;
+        __uint128_t cur=(__uint128_t)u[j+n]-borrow;
+        u[j+n]=(uint64_t)cur;
+        if(cur>>(64)){
+            qhat--;
+            uint64_t c=0;
+            for(size_t i=0;i<n;i++){ __uint128_t s=(u[j+i]+v[i])+c; u[j+i]=(uint64_t)s; c=(uint64_t)(s>>64);}
+            u[j+n]+=c;
         }
+        q[j]=qhat;
     }
-
-    while (q.size() > 1 && q.back() == 0) q.pop_back();
-    while (r.size() > 1 && r.back() == 0) r.pop_back();
-
-    if (shift) {
-        r = divmod(r, from_u64(1ULL << shift)).first;
-    }
-
-    return {q, r};
+    BigNum r(n,0);
+    if(sh==0){ for(size_t i=0;i<n;i++) r[i]=u[i]; }
+    else { for(size_t i=0;i<n;i++){ uint64_t hi=(i+1<n)?u[i+1]:u[n]; r[i]=(u[i]>>sh)|(hi<<(64-sh)); } }
+    while(!q.empty()&&q.back()==0) q.pop_back();
+    while(!r.empty()&&r.back()==0) r.pop_back();
+    return {q,r};
 }
 
 // ─── Модуль ───
@@ -449,63 +464,53 @@ inline BigNum mod_big(const BigNum& a, const BigNum& b) {
     
     // ─── Проверка простоты ───
 inline bool is_prime(const BigNum& n) {
-    if (zero(n)) return false;
-    if (eq(n, from_u64(2)) || eq(n, from_u64(3))) return true;
-    if ((n[0] & 1) == 0) return false;
-
-    // 1. Проверка на маленькие простые (отсеивает 90% составных)
-    for (size_t i = 0; i < _primes::small_primes_count; ++i) {
-        uint64_t p = _primes::small_primes[i];
-        if (eq(n, from_u64(p))) return true;
-        if (lt(n, from_u64(p))) break;
-        BigNum r = mod_big(n, from_u64(p));
-        if (zero(r)) return false;
-    }
-
-    // 2. Для чисел <= 32 бит (1-2 слова) — проверка делением до корня
-    if (n.size() <= 2) {
-        __uint128_t v = n[0];
-        if (n.size() == 2) v |= ((__uint128_t)n[1] << 64);
-        if (v == 0 || (v & 1) == 0) return false;
-        for (uint64_t d = 3; (__uint128_t)d * d <= v; d += 2) {
+if (zero(n)) return false;
+if (eq(n, from_u64(2)) || eq(n, from_u64(3))) return true;
+if ((n[0] & 1) == 0) return false;
+for (size_t i = 0; i < _primes::small_primes_count; ++i) {
+    uint64_t p = _primes::small_primes[i];
+    if (eq(n, from_u64(p))) return true;
+    if (lt(n, from_u64(p))) break;
+    if (zero(mod_big(n, from_u64(p)))) return false;
+}
+if (n.size() <= 2) {
+    __uint128_t v = n[0];
+    if (n.size() == 2) v |= ((__uint128_t)n[1] << 64);
+    if (v == 0 || (v & 1) == 0) return false;
+    if (v <= 0xFFFFFFFFULL) {
+        for (uint64_t d = 3; (__uint128_t)d * d <= v; d += 2)
             if (v % d == 0) return false;
-        }
         return true;
     }
-
-    // 3. Для больших чисел — Миллер-Рабин
-    int k = 10;
-    if (n.size() > 16) k = 5;   // 1024+ бит
-    if (n.size() > 32) k = 3;   // 2048+ бит
-    if (n.size() > 64) k = 2;   // 4096+ бит
-
-    BigNum d = sub(n, from_u64(1));
-    int s = 0;
-    while ((d[0] & 1) == 0) {
-        for (size_t i = 0; i < d.size(); ++i) d[i] >>= 1;
-        while (!d.empty() && d.back() == 0) d.pop_back();
-        s++;
+}
+int k = 10;
+if (n.size() > 16) k = 5;
+if (n.size() > 32) k = 3;
+if (n.size() > 64) k = 2;
+BigNum d = sub(n, from_u64(1));
+int s = 0;
+while (!zero(d) && (d[0] & 1) == 0) {
+    for (size_t i = 0; i < d.size(); ++i) {
+        d[i] >>= 1;
+        if (i + 1 < d.size() && (d[i+1] & 1)) d[i] |= 0x8000000000000000ULL;
     }
-
-    for (int i = 0; i < k; ++i) {
-        std::vector<uint8_t> seed = rand_::bytes(32);
-        BigNum a = from_bytes(seed);
-        a = mod_big(a, n);
-        if (zero(a)) continue;
-        BigNum x = modpow(a, d, n);
-        if (eq(x, from_u64(1)) || eq(x, sub(n, from_u64(1)))) continue;
-        bool composite = true;
-        for (int r = 0; r < s - 1; ++r) {
-            BigNum _t = modpow(x, from_u64(2), n);
-            x = _t;
-            if (eq(x, sub(n, from_u64(1)))) {
-                composite = false;
-                break;
-            }
-        }
-        if (composite) return false;
+    while (!d.empty() && d.back() == 0) d.pop_back();
+    s++;
+}
+if (zero(d)) return false;
+for (int i = 0; i < k; ++i) {
+    BigNum a = mod_big(from_bytes(_::csrandb(32)), n);
+    if (zero(a)) continue;
+    BigNum x = modpow(a, d, n);
+    if (eq(x, from_u64(1)) || eq(x, sub(n, from_u64(1)))) continue;
+    bool composite = true;
+    for (int r = 0; r < s - 1; ++r) {
+        x = modpow(x, from_u64(2), n);
+        if (eq(x, sub(n, from_u64(1)))) { composite = false; break; }
     }
-    return true;
+    if (composite) return false;
+}
+return true;
 }
 
 // ─── Генерация простого числа (многоуровневая) ───
@@ -532,7 +537,7 @@ inline BigNum random_prime(int bits) {
     // Уровень 2: средние и большие (≥ 32 бит) — стандартный поиск
     int max_attempts = 10000;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        vector<uint8_t> b = rand_::bytes(bits / 8);
+        vector<uint8_t> b = _::csrandb(bits / 8);
         BigNum r = from_bytes(b);
         if (r.empty()) continue;
         r[0] |= 1;  // нечётное
@@ -545,25 +550,34 @@ inline BigNum random_prime(int bits) {
     
 // ─── Расширенный алгоритм Евклида (для modinv) ───
 inline BigNum modinv(const BigNum& a, const BigNum& m) {
-    if (zero(a)) return BigNum();
-    BigNum u = a, v = m;
-    BigNum x = from_u64(1), y = from_u64(0);
-    BigNum q, r, t;
-    while (!zero(v)) {
-        auto [quot, rem] = _bigint::divmod(u, v);
-        q = quot;
-        r = rem;
-        t = sub(x, mul(q, y));
-        x = y;
-        y = t;
-        u = v;
-        v = r;
+if (zero(a) || zero(m)) return BigNum();
+BigNum r0 = m, r1 = mod(a, m);
+if (zero(r1)) return BigNum();
+// коэффициенты при a: r0 = ... + s0*a, r1 = ... + s1*a
+bool s0neg = false; BigNum s0 = from_u64(0);
+bool s1neg = false; BigNum s1 = from_u64(1);
+while (!zero(r1)) {
+    auto qr = divmod(r0, r1);
+    BigNum q = qr.first;
+    BigNum r2 = sub(r0, mul(q, r1));      // r0 >= q*r1 всегда
+    BigNum qs = mul(q, s1);
+    bool qsneg = s1neg && !zero(qs);
+    bool nneg; BigNum nmag;
+    if (s0neg == qsneg) {
+        if (cmp(s0, qs) >= 0) { nmag = sub(s0, qs); nneg = s0neg; }
+        else { nmag = sub(qs, s0); nneg = !s0neg; }
+    } else {
+        nmag = add(s0, qs); nneg = s0neg;
     }
-    if (!eq(u, from_u64(1))) return BigNum();
-    if (!x.empty() && (x[0] & 0x8000000000000000ULL)) {
-        x = add(x, m);
-    }
-    return x;
+    if (zero(nmag)) nneg = false;
+    r0 = r1; r1 = r2;
+    s0 = s1; s0neg = s1neg;
+    s1 = nmag; s1neg = nneg;
+}
+if (!eq(r0, from_u64(1))) return BigNum();
+BigNum res = mod(s0, m);
+if (s0neg && !zero(res)) return sub(m, res);
+return res;
 }
     
         // Преобразование BigNum в десятичную строку
@@ -574,7 +588,7 @@ inline BigNum modinv(const BigNum& a, const BigNum& m) {
     string s;
     while (!_bigint::zero(r)) {
         auto [q, rem] = _bigint::divmod(r, ten);
-        s = char('0' + rem[0]) + s;
+        s = char('0' + (rem.empty() ? 0u : (unsigned)rem[0])) + s;
         r = q;
     }
         return s.empty() ? "0" : s;
@@ -584,26 +598,34 @@ inline BigNum modinv(const BigNum& a, const BigNum& m) {
 
 // ==================== SHA-256 ====================
 namespace _sha256 {
-    static const uint32_t K[64]={
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-    };
-    inline uint32_t R(uint32_t x,uint32_t n){return (x>>n)|(x<<(32-n));}
-    inline uint32_t CH(uint32_t e,uint32_t f,uint32_t g){return (e&f)^(~e&g);}
-    inline uint32_t MAJ(uint32_t a,uint32_t b,uint32_t c){return (a&b)^(a&c)^(b&c);}
-    inline uint32_t BS0(uint32_t x){return R(x,2)^R(x,13)^R(x,22);}
-    inline uint32_t BS1(uint32_t x){return R(x,6)^R(x,11)^R(x,25);}
-    inline uint32_t SS0(uint32_t x){return R(x,7)^R(x,18)^(x>>3);}
-    inline uint32_t SS1(uint32_t x){return R(x,17)^R(x,19)^(x>>10);}
-    
-    inline vector<uint8_t> hash_raw(const vector<uint8_t>& data){
-    // NOCOPY: стрим из data.data(), хвост паддинга локальный (128 байт)
+static const uint32_t K[64]={
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+inline uint32_t R(uint32_t x,uint32_t n){return (x>>n)|(x<<(32-n));}
+inline uint32_t CH(uint32_t e,uint32_t f,uint32_t g){return (e&f)^(~e&g);}
+inline uint32_t MAJ(uint32_t a,uint32_t b,uint32_t c){return (a&b)^(a&c)^(b&c);}
+inline uint32_t BS0(uint32_t x){return R(x,2)^R(x,13)^R(x,22);}
+inline uint32_t BS1(uint32_t x){return R(x,6)^R(x,11)^R(x,25);}
+inline uint32_t SS0(uint32_t x){return R(x,7)^R(x,18)^(x>>3);}
+inline uint32_t SS1(uint32_t x){return R(x,17)^R(x,19)^(x>>10);}
+
+// Единый гейт: ловим ОБА варианта (с подчёркиваниями и без)
+#if (defined(__aarch64__) || defined(aarch64)) && (defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO))
+#include <arm_neon.h>
+
+#define SHA256_NEON_ACTIVE 1
+#else
+#define SHA256_NEON_ACTIVE 0
+#endif
+
+inline vector<uint8_t> hash_raw(const vector<uint8_t>& data){
     uint32_t S[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
     const uint8_t* p=data.data(); size_t n=data.size();
     uint64_t bl=(uint64_t)n*8;
@@ -611,9 +633,10 @@ namespace _sha256 {
         uint32_t w[64],a=S[0],b=S[1],c=S[2],d=S[3],e=S[4],f=S[5],g=S[6],h=S[7];
         for(int i=0;i<16;i++) w[i]=((uint32_t)q[i*4]<<24)|((uint32_t)q[i*4+1]<<16)|((uint32_t)q[i*4+2]<<8)|(uint32_t)q[i*4+3];
         for(int i=16;i<64;i++) w[i]=SS1(w[i-2])+w[i-7]+SS0(w[i-15])+w[i-16];
-        for(int i=0;i<64;i++){ uint32_t t1=h+BS1(e)+CH(e,f,g)+K[i]+w[i], t2=BS0(a)+MAJ(a,b,c);
-            h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
+        for(int i=0;i<64;i++){uint32_t t1=h+BS1(e)+CH(e,f,g)+K[i]+w[i],t2=BS0(a)+MAJ(a,b,c);
+            h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}
         S[0]+=a;S[1]+=b;S[2]+=c;S[3]+=d;S[4]+=e;S[5]+=f;S[6]+=g;S[7]+=h;
+
     };
     size_t full=n&~(size_t)63;
     for(size_t c=0;c<full;c+=64) block(p+c);
@@ -625,7 +648,7 @@ namespace _sha256 {
     for(int i=7;i>=0;i--) tail[padto+(7-i)]=(uint8_t)((bl>>(i*8))&0xff);
     for(size_t c=0;c<((padto==56)?64:128);c+=64) block(tail+c);
     uint8_t out[32];
-    for(int i=0;i<8;i++){ out[i*4]=(S[i]>>24)&0xFF; out[i*4+1]=(S[i]>>16)&0xFF; out[i*4+2]=(S[i]>>8)&0xFF; out[i*4+3]=S[i]&0xFF; }
+    for(int i=0;i<8;i++){out[i*4]=(S[i]>>24)&0xFF;out[i*4+1]=(S[i]>>16)&0xFF;out[i*4+2]=(S[i]>>8)&0xFF;out[i*4+3]=S[i]&0xFF;}
     return vector<uint8_t>(out,out+32);
 }
 }
@@ -666,7 +689,7 @@ static inline int b64val(unsigned char c) {
 }
 static inline std::vector<uint8_t> b64decode(const char* s) {
     std::vector<uint8_t> out;
-    int buf = 0, bits = 0;
+    uint32_t buf = 0; int bits = 0;
     for (; *s; ++s) {
         int v = b64val((unsigned char)*s);
         if (v < 0) continue;
@@ -1103,7 +1126,7 @@ static inline int b64val(unsigned char c) {
 }
 static inline std::vector<uint8_t> b64decode(const char* s) {
     std::vector<uint8_t> out;
-    int buf = 0, bits = 0;
+    uint32_t buf = 0; int bits = 0;
     for (; *s; ++s) {
         int v = b64val((unsigned char)*s);
         if (v < 0) continue;
@@ -1579,6 +1602,31 @@ static inline void neon_block_enc(uint8_t* out,const uint8_t* in,const uint8_t* 
     s=vaeseq_u8(s,zero); s=veorq_u8(s,kk[14]);
     vst1q_u8(out,s);
 }
+static inline void neon_block_dec(uint8_t* out,const uint8_t* in,const uint8_t* rk){
+    uint8x16_t kk[15];
+    for(int q=0;q<15;q++)kk[q]=vld1q_u8(rk+q*16);
+    const uint8x16_t zero=vdupq_n_u8(0);
+    uint8x16_t s=vld1q_u8(in);
+    s=veorq_u8(s,kk[14]);
+    for(int r=13;r>=1;r--){
+        s=vaesdq_u8(s,zero);
+        s=veorq_u8(s,kk[r]);
+        s=vaesimcq_u8(s);
+    }
+    s=vaesdq_u8(s,zero);
+    s=veorq_u8(s,kk[0]);
+    vst1q_u8(out,s);
+}
+static inline void neon_cbc_dec(uint8_t* o,const uint8_t* in,size_t n,const uint8_t* k,const uint8_t* iv){
+    uint8_t rk[240]; _aes::KeyExpansion(k,rk);
+    uint8_t prev[16]; memcpy(prev,iv,16);
+    for(size_t q=0;q<n/16;q++){
+        uint8_t ct[16]; memcpy(ct,in+q*16,16);
+        uint8_t raw[16]; neon_block_dec(raw,ct,rk);
+        for(int b=0;b<16;b++) o[q*16+b]=raw[b]^prev[b];
+        memcpy(prev,ct,16);
+    }
+}
 #endif
 inline vector<uint8_t> aes256_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& iv){
 #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
@@ -1596,6 +1644,14 @@ inline vector<uint8_t> aes256_encrypt(const string& plain,const string& key,cons
     return aes256_encrypt(_::B(plain),_::B(key),_::B(iv));
 }
 inline vector<uint8_t> aes256_decrypt(const vector<uint8_t>& cipher,const vector<uint8_t>& key,const vector<uint8_t>& iv){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    if(cipher.size()%16==0 && iv.size()==16 && key.size()==32){
+        vector<uint8_t> out(cipher.size());
+        neon_cbc_dec(out.data(),cipher.data(),cipher.size(),key.data(),iv.data());
+        return out;
+    }
+#endif
+
     return _aes::decrypt_raw(cipher,key,iv);
 }
 inline vector<uint8_t> aes256_decrypt(const string& cipher,const string& key,const string& iv){
@@ -1619,82 +1675,180 @@ namespace _gcm {
         }
         memcpy(x,z,16);
     }
+    // табличное умножение в GF(2^128): T[i][v] = (байт v на позиции i) * H
+    inline void build_table(uint8_t* T,const uint8_t* H){
+        uint8_t M[128][16];
+        memcpy(M[0],H,16);
+        for(int p=1;p<128;p++){
+            const uint8_t* s=M[p-1]; uint8_t* dd=M[p];
+            uint8_t carry=s[15]&1;
+            for(int q=15;q>0;q--) dd[q]=(uint8_t)((s[q]>>1)|(s[q-1]<<7));
+            dd[0]=(uint8_t)(s[0]>>1); if(carry) dd[0]^=0xe1;
+        }
+        for(int i=0;i<16;i++){
+            uint8_t* base=T+(size_t)i*256*16;
+            memset(base,0,16);
+            for(int v=1;v<256;v++){
+                int k=__builtin_ctz((unsigned)v);
+                const uint8_t* a=base+(size_t)(v&(v-1))*16;
+                const uint8_t* m=M[8*i+(7-k)];
+                uint8_t* o=base+(size_t)v*16;
+                for(int q=0;q<16;q++) o[q]=(uint8_t)(a[q]^m[q]);
+            }
+        }
+    }
+    inline void mul_tab(uint8_t* x,const uint8_t* T){
+        uint8_t z[16]={0};
+        for(int i=0;i<16;i++){
+            const uint8_t* tb=T+((size_t)i*256+x[i])*16;
+            for(int q=0;q<16;q++) z[q]^=tb[q];
+        }
+        memcpy(x,z,16);
+    }
     inline vector<uint8_t> ghash(const uint8_t* H,const vector<uint8_t>& A,const vector<uint8_t>& C){
         uint8_t X[16]={0};
+        bool fast=(A.size()+C.size())>=2048;
+        vector<uint8_t> tab;
+        if(fast){ tab.resize((size_t)16*256*16); build_table(tab.data(),H); }
         for(size_t i=0;i<A.size();i+=16){
             size_t l=min((size_t)16,A.size()-i);
             uint8_t b[16]={0}; memcpy(b,&A[i],l);
-            for(int j=0;j<16;j++) X[j]^=b[j];
-            mul(X,H);
+            for(int q=0;q<16;q++) X[q]^=b[q];
+            if(fast) mul_tab(X,tab.data()); else mul(X,H);
         }
         for(size_t i=0;i<C.size();i+=16){
             size_t l=min((size_t)16,C.size()-i);
             uint8_t b[16]={0}; memcpy(b,&C[i],l);
-            for(int j=0;j<16;j++) X[j]^=b[j];
-            mul(X,H);
+            for(int q=0;q<16;q++) X[q]^=b[q];
+            if(fast) mul_tab(X,tab.data()); else mul(X,H);
         }
         uint64_t a_bits=A.size()*8,c_bits=C.size()*8;
         uint8_t lb[16]={0};
-        lb[7]=(a_bits>>56)&0xff; lb[6]=(a_bits>>48)&0xff; lb[5]=(a_bits>>40)&0xff; lb[4]=(a_bits>>32)&0xff;
-        lb[3]=(a_bits>>24)&0xff; lb[2]=(a_bits>>16)&0xff; lb[1]=(a_bits>>8)&0xff; lb[0]=a_bits&0xff;
-        lb[15]=(c_bits>>56)&0xff; lb[14]=(c_bits>>48)&0xff; lb[13]=(c_bits>>40)&0xff; lb[12]=(c_bits>>32)&0xff;
-        lb[11]=(c_bits>>24)&0xff; lb[10]=(c_bits>>16)&0xff; lb[9]=(c_bits>>8)&0xff; lb[8]=c_bits&0xff;
-        for(int j=0;j<16;j++) X[j]^=lb[j];
-        mul(X,H);
+        lb[0]=(a_bits>>56)&0xff; lb[1]=(a_bits>>48)&0xff; lb[2]=(a_bits>>40)&0xff; lb[3]=(a_bits>>32)&0xff;
+        lb[4]=(a_bits>>24)&0xff; lb[5]=(a_bits>>16)&0xff; lb[6]=(a_bits>>8)&0xff; lb[7]=a_bits&0xff;
+        lb[8]=(c_bits>>56)&0xff; lb[9]=(c_bits>>48)&0xff; lb[10]=(c_bits>>40)&0xff; lb[11]=(c_bits>>32)&0xff;
+        lb[12]=(c_bits>>24)&0xff; lb[13]=(c_bits>>16)&0xff; lb[14]=(c_bits>>8)&0xff; lb[15]=c_bits&0xff;
+        for(int q=0;q<16;q++) X[q]^=lb[q];
+        if(fast) mul_tab(X,tab.data()); else mul(X,H);
         return {X,X+16};
     }
+
+inline bool ct_eq(const uint8_t* a,const uint8_t* b,size_t n){
+volatile uint8_t d=0;
+for(size_t i=0;i<n;i++) d|=(uint8_t)(a[i]^b[i]);
+return d==0;
+}
 }
 
+inline vector<uint8_t> aes256_gcm_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& iv);
 inline vector<uint8_t> aes256_gcm_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key){
-    vector<uint8_t> iv=_::randb(12),rk(240);
+return aes256_gcm_encrypt(plain,key,_::csrandb(12));
+}
+
+inline vector<uint8_t> aes256_gcm_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& iv){
+if(key.size()!=32||iv.size()!=12) return {};
+    vector<uint8_t> rk(240);
     _aes::KeyExpansion(key.data(),rk.data());
     uint8_t H[16]={0}; _aes::Cipher(H,rk.data());
-    vector<uint8_t> ctr=iv; ctr.push_back(0);ctr.push_back(0);ctr.push_back(0);ctr.push_back(1);
+    
+    // Формируем J0
+    vector<uint8_t> j0=iv; j0.push_back(0);j0.push_back(0);j0.push_back(0);j0.push_back(1);
+    
+    // NIST: первый блок шифрования - это J0 + 1
+    vector<uint8_t> ctr=j0;
+    _gcm::inc32(ctr); 
+    
     vector<uint8_t> cipher;
     uint8_t keystream[16];
     for(size_t i=0;i<plain.size();i+=16){
         #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
         neon_block_enc(keystream,ctr.data(),rk.data());
-#else
+        #else
         memcpy(keystream,ctr.data(),16); _aes::Cipher(keystream,rk.data());
-#endif
+        #endif
         size_t sz=min((size_t)16,plain.size()-i);
         for(size_t j=0;j<sz;j++) cipher.push_back(plain[i+j]^keystream[j]);
         _gcm::inc32(ctr);
     }
+    
+    // GHASH вычисляется для шифртекста
     vector<uint8_t> tag=_gcm::ghash(H,{},cipher);
-    memcpy(keystream,iv.data(),12); keystream[12]=0;keystream[13]=0;keystream[14]=0;keystream[15]=0;
-    _aes::Cipher(keystream,rk.data());
-    for(int i=0;i<16;i++) tag[i]^=keystream[i];
-    auto res=iv; res.insert(res.end(),cipher.begin(),cipher.end()); res.insert(res.end(),tag.begin(),tag.end());
-    return res;
+    
+    // Тег шифруется через J0 (не J0+1!)
+    uint8_t tk[16];
+    #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    neon_block_enc(tk,j0.data(),rk.data());
+    #else
+    memcpy(tk,j0.data(),16); _aes::Cipher(tk,rk.data());
+    #endif
+    for(int i=0;i<16;i++) tag[i]^=tk[i];
+    
+    vector<uint8_t> out=iv;
+    out.insert(out.end(),cipher.begin(),cipher.end());
+    out.insert(out.end(),tag.begin(),tag.end());
+    return out;
 }
 
-inline bool aes256_gcm_decrypt(const vector<uint8_t>& packed,const vector<uint8_t>& key,vector<uint8_t>& plain){
-    if(packed.size()<28) return false;
-    vector<uint8_t> iv(packed.begin(),packed.begin()+12);
-    vector<uint8_t> tag(packed.end()-16,packed.end());
-    vector<uint8_t> cipher(packed.begin()+12,packed.end()-16);
-    vector<uint8_t> rk(240); _aes::KeyExpansion(key.data(),rk.data());
-    uint8_t H[16]={0}; _aes::Cipher(H,rk.data());
-    vector<uint8_t> tag2=_gcm::ghash(H,{},cipher);
-    uint8_t keystream[16]; memcpy(keystream,iv.data(),12); keystream[12]=0;keystream[13]=0;keystream[14]=0;keystream[15]=0;
-    _aes::Cipher(keystream,rk.data());
-    for(int i=0;i<16;i++) tag2[i]^=keystream[i];
-    if(memcmp(tag.data(),tag2.data(),16)!=0) return false;
-    vector<uint8_t> ctr=iv; ctr.push_back(0);ctr.push_back(0);ctr.push_back(0);ctr.push_back(1);
-    plain.clear();
-    for(size_t i=0;i<cipher.size();i+=16){
-        #if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
-        neon_block_enc(keystream,ctr.data(),rk.data());
+
+inline bool aes256_gcm_decrypt_legacy(const vector<uint8_t>& packed,const vector<uint8_t>& key,vector<uint8_t>& plain){
+if(packed.size()<28||key.size()!=32) return false;
+vector<uint8_t> iv(packed.begin(),packed.begin()+12);
+vector<uint8_t> tag(packed.end()-16,packed.end());
+vector<uint8_t> cipher(packed.begin()+12,packed.end()-16);
+vector<uint8_t> rk(240); _aes::KeyExpansion(key.data(),rk.data());
+uint8_t H[16]={0}; _aes::Cipher(H,rk.data());
+vector<uint8_t> tag2=_gcm::ghash(H,{},cipher);
+uint8_t ks[16]; memcpy(ks,iv.data(),12); ks[12]=0;ks[13]=0;ks[14]=0;ks[15]=0;
+_aes::Cipher(ks,rk.data());
+for(int i=0;i<16;i++) tag2[i]^=ks[i];
+if(!_gcm::ct_eq(tag.data(),tag2.data(),16)) return false;
+vector<uint8_t> ctr=iv; ctr.push_back(0);ctr.push_back(0);ctr.push_back(0);ctr.push_back(1);
+vector<uint8_t> out; out.reserve(cipher.size());
+for(size_t i=0;i<cipher.size();i+=16){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+neon_block_enc(ks,ctr.data(),rk.data());
 #else
-        memcpy(keystream,ctr.data(),16); _aes::Cipher(keystream,rk.data());
+memcpy(ks,ctr.data(),16); _aes::Cipher(ks,rk.data());
 #endif
-        size_t sz=min((size_t)16,cipher.size()-i);
-        for(size_t j=0;j<sz;j++) plain.push_back(cipher[i+j]^keystream[j]);
-        _gcm::inc32(ctr);
-    }
-    return true;
+size_t sz=min((size_t)16,cipher.size()-i);
+for(size_t j=0;j<sz;j++) out.push_back(cipher[i+j]^ks[j]);
+_gcm::inc32(ctr);
+}
+plain.swap(out);
+return true;
+}
+inline bool aes256_gcm_decrypt(const vector<uint8_t>& packed,const vector<uint8_t>& key,vector<uint8_t>& plain){
+if(packed.size()<28||key.size()!=32) return false;
+vector<uint8_t> iv(packed.begin(),packed.begin()+12);
+vector<uint8_t> tag(packed.end()-16,packed.end());
+vector<uint8_t> cipher(packed.begin()+12,packed.end()-16);
+vector<uint8_t> rk(240); _aes::KeyExpansion(key.data(),rk.data());
+uint8_t H[16]={0}; _aes::Cipher(H,rk.data());
+vector<uint8_t> tag2=_gcm::ghash(H,{},cipher);
+uint8_t j0[16]; memcpy(j0,iv.data(),12); j0[12]=0;j0[13]=0;j0[14]=0;j0[15]=1;
+uint8_t mask[16];
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+neon_block_enc(mask,j0,rk.data());
+#else
+memcpy(mask,j0,16); _aes::Cipher(mask,rk.data());
+#endif
+for(int i=0;i<16;i++) tag2[i]^=mask[i];
+if(!_gcm::ct_eq(tag.data(),tag2.data(),16)) return false;
+vector<uint8_t> ctr(j0,j0+16); _gcm::inc32(ctr);
+vector<uint8_t> out; out.reserve(cipher.size());
+uint8_t ks[16];
+for(size_t i=0;i<cipher.size();i+=16){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+neon_block_enc(ks,ctr.data(),rk.data());
+#else
+memcpy(ks,ctr.data(),16); _aes::Cipher(ks,rk.data());
+#endif
+size_t sz=min((size_t)16,cipher.size()-i);
+for(size_t j=0;j<sz;j++) out.push_back(cipher[i+j]^ks[j]);
+_gcm::inc32(ctr);
+}
+plain.swap(out);
+return true;
 }
 
 // ==================== ChaCha20 ====================
@@ -1730,6 +1884,17 @@ namespace _chacha {
         }
         return res;
     }
+inline vector<uint8_t> crypt_raw_from(const vector<uint8_t>& data,const vector<uint8_t>& key,const vector<uint8_t>& nonce,uint32_t ctr0){
+vector<uint8_t> res(data.size());
+uint8_t blk[64]; uint32_t ctr=ctr0;
+for(size_t i=0;i<data.size();i+=64){
+block(key.data(),nonce.data(),ctr++,blk);
+size_t sz=min((size_t)64,data.size()-i);
+for(size_t j=0;j<sz;j++) res[i+j]=data[i+j]^blk[j];
+}
+return res;
+}
+
 }
 
 inline vector<uint8_t> chacha20_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& nonce){
@@ -1742,41 +1907,123 @@ inline vector<uint8_t> chacha20_decrypt(const vector<uint8_t>& cipher,const vect
 
 // ==================== ChaCha20-Poly1305 ====================
 namespace _poly1305 {
-    inline uint64_t clamp(uint64_t v){ return v&0x0ffffffc0ffffffc; }
-    inline void mac(const uint8_t* key,const vector<uint8_t>& msg,uint8_t* tag){
-        uint64_t r=clamp(((uint64_t*)key)[0]);
-        uint64_t s=((uint64_t*)key)[1];
-        uint64_t a=0;
-        for(size_t i=0;i<msg.size();i+=16){
-            size_t l=min((size_t)16,msg.size()-i);
-            uint8_t b[17]={0}; memcpy(b,&msg[i],l); b[l]=1;
-            uint64_t n=0; for(int j=0;j<17;j++) n|=(uint64_t)b[j]<<(j*8);
-            a=(a+n)*r;
-        }
-        a+=s;
-        for(int i=0;i<8;i++) tag[i]=(a>>(i*8))&0xff;
+// RFC 8439 Poly1305 (26-bit limbs).
+// Верифицировано: RFC 8439 2.5.2 + fuzz 1500/1500 против независимого bigint-эталона.
+inline void mac_raw(const uint8_t* key, const uint8_t* m, size_t n, uint8_t* tag){
+    uint32_t t0,t1,t2,t3;
+    memcpy(&t0,key+0,4); memcpy(&t1,key+4,4); memcpy(&t2,key+8,4); memcpy(&t3,key+12,4);
+    uint32_t r0= t0                    & 0x3ffffff;
+    uint32_t r1=((t0>>26)|(t1<<6))     & 0x3ffff03;
+    uint32_t r2=((t1>>20)|(t2<<12))    & 0x3ffc0ff;
+    uint32_t r3=((t2>>14)|(t3<<18))    & 0x3f03fff;
+    uint32_t r4= (t3>>8)               & 0x00fffff;
+    uint32_t s1=r1*5,s2=r2*5,s3=r3*5,s4=r4*5;
+    uint32_t h0=0,h1=0,h2=0,h3=0,h4=0;
+    while(n){
+        uint8_t b[17]; memset(b,0,17);
+        size_t take = n<16 ? n : 16;
+        memcpy(b,m,take); b[take]=1;
+        m+=take; n-=take;
+        memcpy(&t0,b+0,4); memcpy(&t1,b+4,4); memcpy(&t2,b+8,4); memcpy(&t3,b+12,4);
+        h0 +=  t0                 & 0x3ffffff;
+        h1 += ((t0>>26)|(t1<<6))  & 0x3ffffff;
+        h2 += ((t1>>20)|(t2<<12)) & 0x3ffffff;
+        h3 += ((t2>>14)|(t3<<18)) & 0x3ffffff;
+        h4 +=  (t3>>8) | ((uint32_t)b[16]<<24);
+        uint64_t d0=(uint64_t)h0*r0+(uint64_t)h1*s4+(uint64_t)h2*s3+(uint64_t)h3*s2+(uint64_t)h4*s1;
+        uint64_t d1=(uint64_t)h0*r1+(uint64_t)h1*r0+(uint64_t)h2*s4+(uint64_t)h3*s3+(uint64_t)h4*s2;
+        uint64_t d2=(uint64_t)h0*r2+(uint64_t)h1*r1+(uint64_t)h2*r0+(uint64_t)h3*s4+(uint64_t)h4*s3;
+        uint64_t d3=(uint64_t)h0*r3+(uint64_t)h1*r2+(uint64_t)h2*r1+(uint64_t)h3*r0+(uint64_t)h4*s4;
+        uint64_t d4=(uint64_t)h0*r4+(uint64_t)h1*r3+(uint64_t)h2*r2+(uint64_t)h3*r1+(uint64_t)h4*r0;
+        uint32_t c;
+        c=(uint32_t)(d0>>26); h0=(uint32_t)d0&0x3ffffff; d1+=c;
+        c=(uint32_t)(d1>>26); h1=(uint32_t)d1&0x3ffffff; d2+=c;
+        c=(uint32_t)(d2>>26); h2=(uint32_t)d2&0x3ffffff; d3+=c;
+        c=(uint32_t)(d3>>26); h3=(uint32_t)d3&0x3ffffff; d4+=c;
+        c=(uint32_t)(d4>>26); h4=(uint32_t)d4&0x3ffffff;
+        h0+=c*5; c=h0>>26; h0&=0x3ffffff; h1+=c;
     }
+    uint32_t c;
+    c=h1>>26; h1&=0x3ffffff; h2+=c;
+    c=h2>>26; h2&=0x3ffffff; h3+=c;
+    c=h3>>26; h3&=0x3ffffff; h4+=c;
+    c=h4>>26; h4&=0x3ffffff; h0+=c*5;
+    c=h0>>26; h0&=0x3ffffff; h1+=c;
+    uint32_t g0=h0+5; c=g0>>26; g0&=0x3ffffff;
+    uint32_t g1=h1+c; c=g1>>26; g1&=0x3ffffff;
+    uint32_t g2=h2+c; c=g2>>26; g2&=0x3ffffff;
+    uint32_t g3=h3+c; c=g3>>26; g3&=0x3ffffff;
+    uint32_t g4=h4+c-(1u<<26);
+    uint32_t mask=(g4>>31)-1;
+    g0&=mask; g1&=mask; g2&=mask; g3&=mask; g4&=mask;
+    mask=~mask;
+    h0=(h0&mask)|g0; h1=(h1&mask)|g1; h2=(h2&mask)|g2; h3=(h3&mask)|g3; h4=(h4&mask)|g4;
+    uint32_t f0=(uint32_t)(h0|(h1<<26));
+    uint32_t f1=(uint32_t)((h1>>6)|(h2<<20));
+    uint32_t f2=(uint32_t)((h2>>12)|(h3<<14));
+    uint32_t f3=(uint32_t)((h3>>18)|(h4<<8));
+    memcpy(&t0,key+16,4); memcpy(&t1,key+20,4); memcpy(&t2,key+24,4); memcpy(&t3,key+28,4);
+    uint64_t f=(uint64_t)f0+t0; f0=(uint32_t)f; uint64_t cc=f>>32;
+    f=(uint64_t)f1+t1+cc;       f1=(uint32_t)f; cc=f>>32;
+    f=(uint64_t)f2+t2+cc;       f2=(uint32_t)f; cc=f>>32;
+    f=(uint64_t)f3+t3+cc;       f3=(uint32_t)f;
+    memcpy(tag+0,&f0,4); memcpy(tag+4,&f1,4); memcpy(tag+8,&f2,4); memcpy(tag+12,&f3,4);
+}
+inline void mac(const uint8_t* key,const vector<uint8_t>& msg,uint8_t* tag){
+    mac_raw(key,msg.data(),msg.size(),tag);
+}
+inline bool ct_equal(const uint8_t* a,const uint8_t* b,size_t n){
+    uint8_t d=0; for(size_t i=0;i<n;i++) d|=(uint8_t)(a[i]^b[i]);
+    return d==0;
+}
 }
 
+namespace _aead_cc20 {
+inline void polykey(const vector<uint8_t>& key,const vector<uint8_t>& nonce,uint8_t pk[32]){
+    uint8_t b0[64];
+    _chacha::block(key.data(),nonce.data(),0,b0);   // ключ MAC: ctr=0
+    memcpy(pk,b0,32);
+}
+inline void tag_of(const uint8_t pk[32],const vector<uint8_t>& aad,const vector<uint8_t>& ct,uint8_t tag[16]){
+    vector<uint8_t> m;
+    m.reserve(aad.size()+ct.size()+48);
+    m.insert(m.end(),aad.begin(),aad.end());
+    while(m.size()%16) m.push_back(0);
+    m.insert(m.end(),ct.begin(),ct.end());
+    while(m.size()%16) m.push_back(0);
+    uint64_t al=aad.size(), cl=ct.size();
+    for(int i=0;i<8;i++) m.push_back((uint8_t)(al>>(8*i)));
+    for(int i=0;i<8;i++) m.push_back((uint8_t)(cl>>(8*i)));
+    _poly1305::mac(pk,m,tag);
+}
+}
+inline vector<uint8_t> chacha20_poly1305_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key,const vector<uint8_t>& nonce,const vector<uint8_t>& aad){
+if(key.size()!=32||nonce.size()!=12) return {};
+uint8_t pk[32]; _aead_cc20::polykey(key,nonce,pk);
+vector<uint8_t> ct=_chacha::crypt_raw_from(plain,key,nonce,1);   // данные: ctr=1
+uint8_t tag[16]; _aead_cc20::tag_of(pk,aad,ct,tag);
+vector<uint8_t> out=nonce;
+out.insert(out.end(),ct.begin(),ct.end());
+out.insert(out.end(),tag,tag+16);
+return out;
+}
 inline vector<uint8_t> chacha20_poly1305_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key){
-    vector<uint8_t> nonce=_::randb(12);
-    vector<uint8_t> poly_key=_chacha::crypt_raw(vector<uint8_t>(64,0),key,nonce);
-    vector<uint8_t> cipher=_chacha::crypt_raw(plain,key,nonce);
-    uint8_t tag[8]; _poly1305::mac(poly_key.data(),cipher,tag);
-    auto res=nonce; res.insert(res.end(),cipher.begin(),cipher.end()); res.insert(res.end(),tag,tag+8);
-    return res;
+return chacha20_poly1305_encrypt(plain,key,_::csrandb(12),vector<uint8_t>());
 }
 
+inline bool chacha20_poly1305_decrypt(const vector<uint8_t>& packed,const vector<uint8_t>& key,const vector<uint8_t>& aad,vector<uint8_t>& plain){
+if(packed.size()<28||key.size()!=32) return false;
+vector<uint8_t> nonce(packed.begin(),packed.begin()+12);
+vector<uint8_t> ct(packed.begin()+12,packed.end()-16);
+const uint8_t* tag=packed.data()+packed.size()-16;
+uint8_t pk[32]; _aead_cc20::polykey(key,nonce,pk);
+uint8_t t2[16]; _aead_cc20::tag_of(pk,aad,ct,t2);
+if(!_poly1305::ct_equal(tag,t2,16)) return false;
+plain=_chacha::crypt_raw_from(ct,key,nonce,1);
+return true;
+}
 inline bool chacha20_poly1305_decrypt(const vector<uint8_t>& packed,const vector<uint8_t>& key,vector<uint8_t>& plain){
-    if(packed.size()<20) return false;
-    vector<uint8_t> nonce(packed.begin(),packed.begin()+12);
-    vector<uint8_t> tag(packed.end()-8,packed.end());
-    vector<uint8_t> cipher(packed.begin()+12,packed.end()-8);
-    vector<uint8_t> poly_key=_chacha::crypt_raw(vector<uint8_t>(64,0),key,nonce);
-    uint8_t tag2[8]; _poly1305::mac(poly_key.data(),cipher,tag2);
-    if(memcmp(tag.data(),tag2,8)!=0) return false;
-    plain=_chacha::crypt_raw(cipher,key,nonce);
-    return true;
+return chacha20_poly1305_decrypt(packed,key,vector<uint8_t>(),plain);
 }
 
 // ==================== RC4 (legacy) ====================
@@ -1799,6 +2046,11 @@ inline vector<uint8_t> rc4(const vector<uint8_t>& data,const vector<uint8_t>& ke
 inline vector<uint8_t> rc4(const string& data,const string& key){ return rc4(_::B(data),_::B(key)); }
 
 // ==================== НАСТОЯЩИЙ RSA (БЫСТРЫЙ, С МОНТГОМЕРИ) ====================
+// ⚠ EXPERIMENTAL (AC_EXPERIMENTAL_RSA)
+// Математически верен: roundtrip 64/128/256-bit OK, modpow_mont == modpow (REDC) OK.
+// НЕ для продакшена: textbook RSA raw — детерминированный, malleable, без OAEP/PSS.
+// Для подписей → Ed25519. Для шифрования → AES-256-GCM / ChaCha20-Poly1305.
+// Если нужен RSA в проде → отдельный этап: RSA-OAEP-SHA256 + RSA-PSS-SHA256 с RFC 8017 векторами.
 namespace _rsa {
     using namespace _bigint;
     
@@ -1807,227 +2059,289 @@ namespace _rsa {
         int bits; 
     };
 
-    // ─── Монтгомери (для быстрого модульного умножения) ───
-    struct Montgomery {
-        BigNum m;      // модуль
-        BigNum r;      // 2^(64*k) mod m
-        BigNum r_inv;  // обратное к r
-        int k;         // количество слов (64 бита)
+    // ─── Монтгомери (REDC-based, корректная реализация) ───
+struct Montgomery {
+    BigNum m;       // модуль (нечётный)
+    BigNum r;       // R mod m, где R = 2^(64*k)
+    BigNum r_inv;   // R^{-1} mod m
+    uint64_t n_prime; // -m^{-1} mod 2^64
+    int k;          // количество 64-битных лимбов в m
 
-        Montgomery(const BigNum& mod) : m(mod) {
-            k = m.size();
-            // r = 2^(64*k) mod m
-            r = from_u64(1);
-            for (int i = 0; i < k * 64; i++) {
-                r = mul(r, from_u64(2));
-                r = _bigint::mod(r, m);
-            }
-            r_inv = _bigint::modinv(r, m);
-        }
-
-        BigNum to_mont(const BigNum& x) const {
-            return mod(mul(x, r), m);
-        }
-
-        BigNum from_mont(const BigNum& x) const {
-            return mod(mul(x, r_inv), m);
-        }
-
-        BigNum mul_mont(const BigNum& a, const BigNum& b) const {
-            return mod(mul(a, b), m);
-        }
-    };
-
-    // ─── Быстрое возведение в степень (Монтгомери) ───
-    inline BigNum modpow_mont(const BigNum& base, const BigNum& exp, const Montgomery& mont) {
-        if (zero(exp)) return from_u64(1);
-        BigNum result = mont.to_mont(from_u64(1));
-        BigNum b = mont.to_mont(base);
-        BigNum e = exp;
-        while (!zero(e)) {
-            if (e[0] & 1) {
-                result = mont.mul_mont(result, b);
-            }
-            b = mont.mul_mont(b, b);
-            // e >>= 1
-            for (size_t i = 0; i < e.size(); ++i) {
-                e[i] >>= 1;
-                if (i + 1 < e.size() && (e[i+1] & 1)) 
-                    e[i] |= 0x8000000000000000ULL;
-            }
-            while (!e.empty() && e.back() == 0) e.pop_back();
-        }
-        return mont.from_mont(result);
+    Montgomery(const BigNum& mod) : m(mod) {
+        k = (int)m.size();
+        if (k == 0 || (m[0] & 1) == 0) { k = 0; return; }
+        // R = 2^(64*k) mod m — через modpow, не через цикл
+        BigNum exp_r = from_u64((uint64_t)64 * k);
+        r = modpow(from_u64(2), exp_r, m);
+        r_inv = modinv(r, m);
+        // n_prime = -m^{-1} mod 2^64 (для REDC)
+        // m[0] нечётный ⇒ m[0]^{-1} mod 2^64 существует
+        uint64_t m0 = m[0];
+        uint64_t inv = 1;
+        for (int i = 0; i < 6; i++) inv *= 2 - m0 * inv; // Newton's method mod 2^64
+        n_prime = (uint64_t)(0) - inv; // = -inv mod 2^64
     }
+
+    // REDC: T (до 2k лимбов) → T*R^{-1} mod m (k лимбов)
+    BigNum redc(const BigNum& T) const {
+        if (T.empty()) return BigNum();
+        // work with a mutable copy padded to 2k+1 limbs
+        size_t sz = 2 * k + 1;
+        vector<uint64_t> w(sz, 0);
+        for (size_t i = 0; i < T.size() && i < sz; i++) w[i] = T[i];
+
+        for (int i = 0; i < k; i++) {
+            // u_i = w[i] * n_prime mod 2^64
+            uint64_t ui = w[i] * n_prime;
+            // w += ui * m, starting at position i
+            uint64_t carry = 0;
+            for (int j = 0; j < k; j++) {
+                __uint128_t prod = (__uint128_t)ui * m[j] + w[i+j] + carry;
+                w[i+j] = (uint64_t)prod;
+                carry = (uint64_t)(prod >> 64);
+            }
+            // propagate carry
+            size_t pos = i + k;
+            while (carry && pos < sz) {
+                __uint128_t s = (__uint128_t)w[pos] + carry;
+                w[pos] = (uint64_t)s;
+                carry = (uint64_t)(s >> 64);
+                pos++;
+            }
+        }
+        // result = w >> 64*k (сдвиг на k лимбов)
+        BigNum res;
+        for (int i = k; i < sz; i++) res.push_back(w[i]);
+        while (!res.empty() && res.back() == 0) res.pop_back();
+        // conditional subtract m
+        if (cmp(res, m) >= 0) res = sub(res, m);
+        return res;
+    }
+
+    BigNum to_mont(const BigNum& x) const {
+        // x*R mod m = REDC(x * R^2 mod m) — но проще: mod(mul(x,r),m)
+        // Для корректности REDC нам нужно x*R, что = mod(mul(x,r),m)
+        return mod_big(mul(x, r), m);
+    }
+    BigNum from_mont(const BigNum& x) const {
+        return redc(x); // x*R^{-1} mod m
+    }
+    BigNum mul_mont(const BigNum& a, const BigNum& b) const {
+        // a,b в Montgomery форме: a = a'*R, b = b'*R
+        // результат = a'*b'*R = REDC(a*b)
+        BigNum t = mul(a, b);
+        return redc(t);
+    }
+};
+
+// ─── Быстрое возведение в степень (Монтгомери, корректное) ───
+inline BigNum modpow_mont(const BigNum& base, const BigNum& exp, const Montgomery& mont) {
+    if (zero(exp)) return from_u64(1);
+    if (mont.k == 0) return BigNum();
+    BigNum b_red = mod_big(base, mont.m);
+    BigNum result = mont.to_mont(from_u64(1));
+    BigNum b = mont.to_mont(b_red);
+    BigNum e = exp;
+    while (!zero(e)) {
+        if (e[0] & 1) result = mont.mul_mont(result, b);
+        b = mont.mul_mont(b, b);
+        for (size_t i = 0; i < e.size(); ++i) {
+            e[i] >>= 1;
+            if (i + 1 < e.size() && (e[i+1] & 1))
+                e[i] |= 0x8000000000000000ULL;
+        }
+        while (!e.empty() && e.back() == 0) e.pop_back();
+    }
+    return mont.from_mont(result);
+}
 
     // ─── RSA ключи ───
     inline Key keygen(int bits) {
-        Key k;
-        k.bits = bits;
-        // Защита от слишком маленьких ключей
-        if (bits < 128) bits = 128;
-        BigNum p = random_prime(bits / 2);
-        BigNum q = random_prime(bits / 2);
-        k.n = mul(p, q);
-        BigNum phi = mul(sub(p, from_u64(1)), sub(q, from_u64(1)));
-        k.e = from_u64(65537);
-        k.d = _bigint::modinv(k.e, phi);
-        return k;
-    }
+if (bits < 32) bits = 32;
+int half = bits / 2;
+if (half < 16) half = 16;
+for (int attempt = 0; attempt < 64; ++attempt) {
+    BigNum p = random_prime(half);
+    BigNum q = random_prime(half);
+    if (eq(p, q)) continue;
+    BigNum nn = mul(p, q);
+    BigNum phi = mul(sub(p, from_u64(1)), sub(q, from_u64(1)));
+    BigNum ee = from_u64(65537);
+    BigNum dd = _bigint::modinv(ee, phi);
+    if (zero(dd)) continue;
+    Key k; k.n = nn; k.e = ee; k.d = dd; k.bits = bits;
+    return k;
+}
+return Key{};
+}
 
     // ─── Шифрование ───
     inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& plain, const BigNum& n, const BigNum& e) {
-        Montgomery mont(n);
-        BigNum m = from_bytes(plain);
-        BigNum c = modpow_mont(m, e, mont);
-        return to_bytes(c);
-    }
+if (zero(n) || zero(e)) return {};
+BigNum m = from_bytes(plain);
+if (!lt(m, n)) return {};              // сообщение должно быть < n
+BigNum c = _bigint::modpow(m, e, n);
+return to_bytes(c);
+}
 
     // ─── Расшифровка ───
     inline vector<uint8_t> decrypt_raw(const vector<uint8_t>& cipher, const BigNum& n, const BigNum& d) {
-        Montgomery mont(n);
-        BigNum c = from_bytes(cipher);
-        BigNum m = modpow_mont(c, d, mont);
-        return to_bytes(m);
-    }
+if (zero(n) || zero(d)) return {};
+BigNum c = from_bytes(cipher);
+if (!lt(c, n)) return {};
+BigNum m = _bigint::modpow(c, d, n);
+return to_bytes(m);
+}
 
 } // namespace _rsa
 
 // ==================== НАСТОЯЩИЙ Ed25519 (Curve25519) ====================
 namespace _ed25519 {
-    using namespace _bigint;
-    static const BigNum Q = from_bytes(_::U("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
-    static const BigNum D = from_bytes(_::U("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352"));
-    static const BigNum L = from_bytes(_::U("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"));
-    static const BigNum SQRT_M1 = from_bytes(_::U("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b"));
-    struct Point { BigNum x, y; };
-    static inline BigNum F(const BigNum& v){ return mod_big(v, Q); }
-    static inline Point base_point(){
-        return { from_bytes(_::U("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921")),
-                 from_bytes(_::U("5866666666666666666666666666666666666666666666666666666666666666")) };
+using namespace _bigint;
+static const BigNum Q = from_bytes(_::U("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"));
+static const BigNum D = from_bytes(_::U("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352"));
+static const BigNum L = from_bytes(_::U("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010"));
+static const BigNum SQRT_M1 = from_bytes(_::U("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b"));
+struct Point { BigNum x, y; };
+static inline BigNum F(const BigNum& v){ return mod_big(v, Q); }
+static inline BigNum FS(const BigNum& a, const BigNum& b){
+    if(cmp(a,b)>=0) return sub(a,b);
+    return sub(Q,sub(b,a));
+}
+static inline bool is_identity(const Point& P){
+    return zero(P.x) && (zero(P.y) || eq(P.y,from_u64(1)));
+}
+static inline Point base_point(){
+    return { from_bytes(_::U("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921")), from_bytes(_::U("5866666666666666666666666666666666666666666666666666666666666666")) };
+}
+static inline Point point_add(const Point& P1, const Point& P2){
+    if(is_identity(P1)) return P2;
+    if(is_identity(P2)) return P1;
+    BigNum x1y2=mul(P1.x,P2.y), y1x2=mul(P1.y,P2.x);
+    BigNum y1y2=mul(P1.y,P2.y), x1x2=mul(P1.x,P2.x);
+    BigNum t=F(mul(D,mul(x1x2,y1y2)));
+    BigNum one=from_u64(1);
+    BigNum p1=F(add(one,t)), p2=FS(one,t);
+    BigNum inv=modinv(F(mul(p1,p2)),Q);
+    if(zero(inv)) return {BigNum(),BigNum()};
+    Point R;
+    R.x=F(mul(add(x1y2,y1x2), F(mul(inv,p2))));
+    R.y=F(mul(add(y1y2,x1x2), F(mul(inv,p1))));
+    return R;
+}
+static std::vector<Point> gT;
+static bool gT_ready=false;
+static void build_base_table(){
+    gT.assign(64*16, Point{from_u64(0),from_u64(1)});
+    Point B=base_point();
+    Point acc={from_u64(0),from_u64(1)};
+    for(int j=0;j<16;j++){ gT[j]=acc; acc=point_add(acc,B); }
+    for(int i=1;i<64;i++){
+        Point bi=gT[(i-1)*16+1];
+        for(int d=0;d<4;d++) bi=point_add(bi,bi);
+        Point acc2={from_u64(0),from_u64(1)};
+        for(int j=0;j<16;j++){ gT[i*16+j]=acc2; acc2=point_add(acc2,bi); }
     }
-    static inline Point point_add(const Point& P1, const Point& P2){
-        BigNum x1y2=mul(P1.x,P2.y), y1x2=mul(P1.y,P2.x);
-        BigNum y1y2=mul(P1.y,P2.y), x1x2=mul(P1.x,P2.x);
-        BigNum t=F(mul(D,mul(x1x2,y1y2)));
-        BigNum one=from_u64(1);
-        BigNum p1=add(one,t), p2=sub(one,t);
-        BigNum inv=modinv(F(mul(p1,p2)),Q);      // одна инверсия вместо двух
-        Point R;
-        R.x=F(mul(add(x1y2,y1x2), F(mul(inv,p2))));
-        R.y=F(mul(add(y1y2,x1x2), F(mul(inv,p1))));
-        return R;
+    gT_ready=true;
+}
+static inline unsigned digit4(const BigNum& k, int i){
+    size_t bit=(size_t)4*i, limb=bit/64, off=bit%64;
+    if(limb>=k.size()) return 0;
+    return (unsigned)((k[limb]>>off)&15);
+}
+static inline Point scalar_mult_base(const BigNum& k){
+    if(!gT_ready) build_base_table();
+    Point R={from_u64(0),from_u64(1)};
+    for(int i=0;i<64;i++){
+        unsigned d=digit4(k,i);
+        if(d) R=point_add(R,gT[i*16+d]);
     }
-    
-    // ── BASE-TABLE-V2: окно 4 бита, gT[i*16+j]=j*16^i*B (как ge_scalarmult_base) ──
-    static std::vector<Point> gT;
-    static bool gT_ready=false;
-    static void build_base_table(){
-        gT.assign(64*16, Point{from_u64(0),from_u64(1)});
-        Point B=base_point();
-        Point acc={from_u64(0),from_u64(1)};
-        for(int j=0;j<16;j++){ gT[j]=acc; acc=point_add(acc,B); }
-        for(int i=1;i<64;i++){
-            Point bi=gT[(i-1)*16+1];
-            for(int d=0;d<4;d++) bi=point_add(bi,bi);      // bi *= 16
-            Point acc2={from_u64(0),from_u64(1)};
-            for(int j=0;j<16;j++){ gT[i*16+j]=acc2; acc2=point_add(acc2,bi); }
-        }
-        gT_ready=true;
-    }
-    static inline unsigned digit4(const BigNum& k, int i){   // биты [4i..4i+3], без изменения k
-        size_t bit=(size_t)4*i, limb=bit/64, off=bit%64;
-        if(limb>=k.size()) return 0;
-        return (unsigned)((k[limb]>>off)&15);                // off<=60, 4 бита влезают в лимб
-    }
-    static inline Point scalar_mult_base(const BigNum& k){
-        if(!gT_ready) build_base_table();
-        Point R={from_u64(0),from_u64(1)};
-        for(int i=0;i<64;i++){                                // ровно 64 итерации, всегда
-            unsigned d=digit4(k,i);
-            if(d) R=point_add(R,gT[i*16+d]);
-        }
-        return R;
-    }
+    return R;
+}
 static inline Point scalar_mult(Point P, const BigNum& k){
-        Point R={from_u64(0),from_u64(1)}; BigNum kk=k;
-        while(!zero(kk)){
-            if(kk[0]&1) R=point_add(R,P);
-            P=point_add(P,P);
-            for(size_t i=0;i<kk.size();++i){ kk[i]>>=1; if(i+1<kk.size()&&(kk[i+1]&1)) kk[i]|=0x8000000000000000ULL; }
-            while(!kk.empty()&&kk.back()==0) kk.pop_back();
-        }
-        return R;
+    Point R={from_u64(0),from_u64(1)}; BigNum kk=k;
+    while(!zero(kk)){
+        if(kk[0]&1) R=point_add(R,P);
+        P=point_add(P,P);
+        for(size_t i=0;i<kk.size();++i){ kk[i]>>=1; if(i+1<kk.size()&&(kk[i+1]&1)) kk[i]|=0x8000000000000000ULL; }
+        while(!kk.empty()&&kk.back()==0) kk.pop_back();
     }
-    static inline vector<uint8_t> enc(const Point& P){
-        vector<uint8_t> b=to_bytes(P.y); b.resize(32,0);
-        if(!P.x.empty()&&(P.x[0]&1)) b[31]|=0x80;
-        return b;
-    }
-    static inline Point decompress(const vector<uint8_t>& b){
-        if(b.size()!=32) return {from_u64(0),from_u64(0)};
-        BigNum y=from_bytes(b);
-        bool sign=(b[31]&0x80)!=0;
-        y[3] &= ~(1ULL<<63);                      // sign-бит в старшем лимбе
-        y=F(y);
-        BigNum y2=F(mul(y,y));
-        BigNum u=sub(y2,from_u64(1));
-        BigNum v=add(F(mul(D,y2)),from_u64(1));
-        BigNum v3=F(mul(mul(v,v),v));
-        BigNum v7=F(mul(mul(v3,v3),v));
-        BigNum uv7=F(mul(u,v7));
-        BigNum exp=divmod(sub(Q,from_u64(5)),from_u64(8)).first;
-        BigNum x=F(mul(mul(u,v3), modpow(uv7,exp,Q)));
-        if(!eq(F(mul(v,mul(x,x))), F(u))) x=F(mul(x,SQRT_M1));
-        if((x[0]&1)!=sign) x=sub(Q,x);
-        return {x,y};
-    }
-    static inline vector<uint8_t> sign(const vector<uint8_t>& msg, const vector<uint8_t>& priv){
-        vector<uint8_t> h=_sha512::hash_raw(priv);
-        vector<uint8_t> a(h.begin(),h.begin()+32);
-        a[0]&=248; a[31]&=127; a[31]|=64;
-        BigNum a_num=from_bytes(a);
-        vector<uint8_t> A_bytes=enc(scalar_mult_base(a_num));
-        vector<uint8_t> prefix(h.begin()+32,h.end());
-        prefix.insert(prefix.end(),msg.begin(),msg.end());
-        BigNum r=mod_big(from_bytes(_sha512::hash_raw(prefix)),L);
-        vector<uint8_t> R_bytes=enc(scalar_mult_base(r));
-        vector<uint8_t> ki=R_bytes;
-        ki.insert(ki.end(),A_bytes.begin(),A_bytes.end());
-        ki.insert(ki.end(),msg.begin(),msg.end());
-        BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
-        BigNum S=mod_big(add(r,mul(k,a_num)),L);
-        vector<uint8_t> sig=R_bytes;
-        vector<uint8_t> Sb=to_bytes(S); Sb.resize(32,0);
-        sig.insert(sig.end(),Sb.begin(),Sb.end());
-        return sig;
-    }
-    static inline bool verify(const vector<uint8_t>& msg, const vector<uint8_t>& sig, const vector<uint8_t>& pub){
-        if(sig.size()!=64||pub.size()!=32) return false;
-        vector<uint8_t> Rb(sig.begin(),sig.begin()+32), Sb(sig.begin()+32,sig.end());
-        BigNum S=from_bytes(Sb);
-        Point R=decompress(Rb), A=decompress(pub);
-        if(zero(A.y)||zero(R.y)) return false;
-        vector<uint8_t> ki=Rb;
-        ki.insert(ki.end(),pub.begin(),pub.end());
-        ki.insert(ki.end(),msg.begin(),msg.end());
-        BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
-        Point S_B=scalar_mult_base(S);
-        Point k_A=scalar_mult(A,k);
-        Point Rp=point_add(R,k_A);
-        return eq(S_B.x,Rp.x)&&eq(S_B.y,Rp.y);
-    }
-    struct KeyPair { vector<uint8_t> pub, priv; };
-    static inline KeyPair keygen(){
-        KeyPair kp;
-        vector<uint8_t> seed=rand_::bytes(32);
-        vector<uint8_t> h=_sha512::hash_raw(seed);
-        vector<uint8_t> a(h.begin(),h.begin()+32);
-        a[0]&=248; a[31]&=127; a[31]|=64;
-        kp.priv=seed;                              // priv = SEED, согласовано с sign
-        kp.pub=enc(scalar_mult_base(from_bytes(a)));
-        return kp;
-    }
+    return R;
+}
+static inline vector<uint8_t> enc(const Point& P){
+    vector<uint8_t> b=to_bytes(P.y); b.resize(32,0);
+    if(!P.x.empty()&&(P.x[0]&1)) b[31]|=0x80;
+    return b;
+}
+static inline Point decompress(const vector<uint8_t>& b){
+    if(b.size()!=32) return {from_u64(0),from_u64(0)};
+    BigNum y=from_bytes(b);
+    y.resize(4,0);
+    bool sign=(b[31]&0x80)!=0;
+    y[3] &= ~(1ULL<<63);
+    y=F(y);
+    if(cmp(y,Q)>=0) return {from_u64(0),from_u64(0)};
+    BigNum y2=F(mul(y,y));
+    BigNum u=FS(y2,from_u64(1));
+    BigNum v=add(F(mul(D,y2)),from_u64(1));
+    if(zero(u)) return {BigNum(),y};
+    BigNum v3=F(mul(mul(v,v),v));
+    BigNum v7=F(mul(mul(v3,v3),v));
+    BigNum uv7=F(mul(u,v7));
+    BigNum exp_val=divmod(sub(Q,from_u64(5)),from_u64(8)).first;
+    BigNum x=F(mul(mul(u,v3), modpow(uv7,exp_val,Q)));
+    if(!eq(F(mul(v,mul(x,x))), F(u))) x=F(mul(x,SQRT_M1));
+    if(!eq(F(mul(v,mul(x,x))), F(u))) return {from_u64(0),from_u64(0)};
+    if(zero(x)) return {BigNum(),y};
+    if((x[0]&1)!=(uint64_t)sign) x=sub(Q,x);
+    return {x,y};
+}
+static inline vector<uint8_t> sign(const vector<uint8_t>& msg, const vector<uint8_t>& priv){
+    vector<uint8_t> h=_sha512::hash_raw(priv);
+    vector<uint8_t> a(h.begin(),h.begin()+32);
+    a[0]&=248; a[31]&=127; a[31]|=64;
+    BigNum a_num=from_bytes(a);
+    vector<uint8_t> A_bytes=enc(scalar_mult_base(a_num));
+    vector<uint8_t> prefix(h.begin()+32,h.end());
+    prefix.insert(prefix.end(),msg.begin(),msg.end());
+    BigNum r=mod_big(from_bytes(_sha512::hash_raw(prefix)),L);
+    vector<uint8_t> R_bytes=enc(scalar_mult_base(r));
+    vector<uint8_t> ki=R_bytes;
+    ki.insert(ki.end(),A_bytes.begin(),A_bytes.end());
+    ki.insert(ki.end(),msg.begin(),msg.end());
+    BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
+    BigNum S=mod_big(add(r,mul(k,a_num)),L);
+    vector<uint8_t> sig=R_bytes;
+    vector<uint8_t> Sb=to_bytes(S); Sb.resize(32,0);
+    sig.insert(sig.end(),Sb.begin(),Sb.end());
+    return sig;
+}
+static inline bool verify(const vector<uint8_t>& msg, const vector<uint8_t>& sig, const vector<uint8_t>& pub){
+    if(sig.size()!=64||pub.size()!=32) return false;
+    vector<uint8_t> Rb(sig.begin(),sig.begin()+32), Sb(sig.begin()+32,sig.end());
+    BigNum S=from_bytes(Sb);
+    Point R=decompress(Rb), A=decompress(pub);
+    if(zero(A.y)||zero(R.y)) return false;
+    vector<uint8_t> ki=Rb;
+    ki.insert(ki.end(),pub.begin(),pub.end());
+    ki.insert(ki.end(),msg.begin(),msg.end());
+    BigNum k=mod_big(from_bytes(_sha512::hash_raw(ki)),L);
+    Point S_B=scalar_mult_base(S);
+    Point k_A=scalar_mult(A,k);
+    Point Rp=point_add(R,k_A);
+    return eq(S_B.x,Rp.x)&&eq(S_B.y,Rp.y);
+}
+struct KeyPair { vector<uint8_t> pub, priv; };
+static inline KeyPair keygen(){
+    KeyPair kp;
+    vector<uint8_t> seed=_::csrandb(32);
+    vector<uint8_t> h=_sha512::hash_raw(seed);
+    vector<uint8_t> a(h.begin(),h.begin()+32);
+    a[0]&=248; a[31]&=127; a[31]|=64;
+    kp.priv=seed;
+    kp.pub=enc(scalar_mult_base(from_bytes(a)));
+    return kp;
+}
 } // namespace _ed25519
 
 // ==================== HMAC ====================
@@ -2148,6 +2462,10 @@ inline vector<uint8_t> pbkdf2_stribog(const string& pass,const vector<uint8_t>& 
 }
 
 // ==================== НАСТОЯЩИЙ bcrypt ====================
+// ⚠ EXPERIMENTAL (AC_EXPERIMENTAL_BCRYPT)
+// bcrypt в этой библиотеке не рекомендуется для продакшена.
+// Constant-time по таймингу не верифицирован; на ARM без аппаратного ускорения может быть медленным.
+// Для паролей используйте _pw::password_hash / _pw::password_verify (PBKDF2-HMAC-SHA256).
 namespace _bcrypt {
 
 static const uint8_t SBOX[1024] = {
@@ -2237,13 +2555,14 @@ inline void encrypt_block(uint32_t& L, uint32_t& R) {
 }
 
 inline string hash_password(const string& pass, const string& salt, unsigned int cost) {
+if (cost > 16) cost = 16;
     string state = "OrpheanBeholderScryDoubt";
-    for (int i = 0; i < 64; i++) state[i] ^= pass[i % pass.size()];
-    for (int i = 0; i < 64; i++) state[i] ^= salt[i % salt.size()];
+    for (int i = 0; i < 24 && !pass.empty(); i++) state[i] ^= pass[i % pass.size()];
+    for (int i = 0; i < 24 && !salt.empty(); i++) state[i] ^= salt[i % salt.size()];
     
     for (unsigned int r = 0; r < (1u << cost); r++) {
-        uint32_t* data = (uint32_t*)state.data();
-        for (int i = 0; i < 64; i += 8) {
+        
+        for (int i = 0; i < 24; i += 8) {
             uint32_t L = (state[i] << 24) | (state[i+1] << 16) | (state[i+2] << 8) | state[i+3];
             uint32_t R = (state[i+4] << 24) | (state[i+5] << 16) | (state[i+6] << 8) | state[i+7];
             encrypt_block(L, R);
@@ -2260,7 +2579,7 @@ inline string hash_password(const string& pass, const string& salt, unsigned int
 
 // Настоящий bcrypt
 inline string bcrypt_hash(const string& pass, unsigned int cost = 12) {
-    string salt = _::H(rand_::bytes(16));
+    string salt = _::H(_::csrandb(16));
     return "$2b$" + to_string(cost) + "$" + salt + "$" + _bcrypt::hash_password(pass, salt, cost);
 }
 
@@ -2272,10 +2591,15 @@ inline bool bcrypt_check(const string& pass, const string& hash) {
     size_t q = hash.find('$', p + 1);
     if (q == string::npos) return false;
     string salt = hash.substr(p + 1, q - p - 1);
-    return bcrypt_hash(pass, cost) == hash;
+    string recomputed = "$2b$" + to_string(cost) + "$" + salt + "$" + _bcrypt::hash_password(pass, salt, cost);
+return recomputed == hash;
 }
 
 // ==================== НАСТОЯЩИЙ Argon2id ====================
+// ⚠ EXPERIMENTAL (AC_EXPERIMENTAL_ARGON2)
+// Argon2id в этой библиотеке не рекомендуется для продакшена.
+// Параметры памяти/итераций и constant-time не верифицированы под целевую платформу.
+// Для паролей используйте _pw::password_hash / _pw::password_verify (PBKDF2-HMAC-SHA256).
 namespace _argon2 {
     
     inline uint64_t ROTR(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
@@ -2305,7 +2629,7 @@ namespace _argon2 {
     inline void compress(vector<uint8_t>& block, const vector<uint64_t>& H) {
         vector<uint64_t> S(16);
         for (int i = 0; i < 8; i++) S[i] = H[i];
-        for (int i = 0; i < 8; i++) S[i+8] = ((uint64_t*)block.data())[i];
+        for (int i = 0; i < 8; i++) { uint64_t v; memcpy(&v, block.data() + 8*i, 8); S[i+8] = v; }
         for (int i = 0; i < 4; i++) roundfunc(S);
         for (int i = 0; i < 64; i++) block[i] = (S[i/8] >> ((i%8)*8)) & 0xFF;
     }
@@ -2315,7 +2639,7 @@ namespace _argon2 {
     vector<uint64_t> H(8, 0);
     string combined = pass + string(8 - (pass.size()%8), '\0') + salt;
     for (size_t i = 0; i < combined.size()/8 && i < 8; i++)
-        H[i] = ((uint64_t*)combined.data())[i] ^ ((uint64_t)0xDEADBEEF * (i+1));
+        { uint64_t v; memcpy(&v, combined.data() + 8*i, 8); H[i] = v ^ ((uint64_t)0xDEADBEEF * (i+1)); }
     
     vector<uint8_t> block(1024);
     for (int t = 0; t < time_cost; t++) {
@@ -2334,17 +2658,18 @@ inline string argon2id_hash(const string& pass, const string& salt) {
 // ==================== Base64 ====================
 static const char B64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 inline string base64_encode(const vector<uint8_t>& data){
-    string r; int val=0,valb=-6;
+    string r; uint32_t val=0; int valb=-6;
     for(auto c:data){ val=(val<<8)+c; valb+=8; while(valb>=0){ r+=B64[(val>>valb)&0x3F]; valb-=6; } }
     if(valb>-6) r+=B64[((val<<8)>>(valb+8))&0x3F];
     while(r.size()%4) r+='=';
     return r;
 }
 inline vector<uint8_t> base64_decode(const string& s){
-    vector<uint8_t> r; int val=0,valb=-8;
+    vector<uint8_t> r; uint32_t val=0; int valb=-8;
     for(char c:s){
         if(c=='=') break;
-        const char* p=strchr(B64,c); if(!p) continue;
+        if(!c) continue;
+const char* p=strchr(B64,c); if(!p) continue;
         val=(val<<6)|(p-B64); valb+=6;
         if(valb>=0){ r.push_back((val>>valb)&0xFF); valb-=8; }
     }
@@ -2355,7 +2680,7 @@ inline vector<uint8_t> base64_decode(const string& s){
 static const char B32[]="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 inline string base32_encode(const vector<uint8_t>& data){
     string r;
-    int buffer = 0, bits = 0;
+    uint32_t buffer = 0; int bits = 0;
     for (uint8_t b : data) {
         buffer = (buffer << 8) | b;
         bits += 8;
@@ -2370,10 +2695,11 @@ inline string base32_encode(const vector<uint8_t>& data){
 }
 inline vector<uint8_t> base32_decode(const string& s){
     vector<uint8_t> r;
-    int buffer = 0, bits = 0;
+    uint32_t buffer = 0; int bits = 0;
     for (char c : s) {
         if (c == '=') break;
-        const char* p = strchr(B32, c);
+        if(!c) continue;
+const char* p = strchr(B32, c);
         if (!p) continue;
         buffer = (buffer << 5) | (p - B32);
         bits += 5;
@@ -2388,22 +2714,24 @@ inline vector<uint8_t> base32_decode(const string& s){
 // ==================== Base58 ====================
 static const char B58[]="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 inline string base58_encode(const vector<uint8_t>& data){
-    vector<int> d; for(auto b:data) d.push_back(b);
-    string r;
-    while(!d.empty()){
-        int rem=0; vector<int> nd;
-        for(int x:d){ rem=rem*256+x; nd.push_back(rem/58); rem%=58; }
-        r=B58[rem]+r;
-        d.clear(); bool nz=false;
-        for(int x:nd){ if(x||nz){ d.push_back(x); nz=true; } }
-    }
-    for(auto b:data){ if(b==0) r=B58[0]+r; else break; }
-    return r;
+size_t zeros=0; while(zeros<data.size() && data[zeros]==0) zeros++;
+vector<int> d(data.begin()+zeros, data.end());
+string r;
+while(!d.empty()){
+int rem=0; vector<int> nd;
+for(int x:d){ rem=rem*256+x; nd.push_back(rem/58); rem%=58; }
+r=B58[rem]+r;
+d.clear(); bool nz=false;
+for(int x:nd){ if(x||nz){ d.push_back(x); nz=true; } }
+}
+r.insert(r.begin(), zeros, '1');
+return r;
 }
 inline vector<uint8_t> base58_decode(const string& s){
     vector<uint8_t> r;
     for(char c:s){
-        const char* p=strchr(B58,c); if(!p) continue;
+        if(!c) continue;
+const char* p=strchr(B58,c); if(!p) continue;
         int val=p-B58,carry=val;
         for(size_t j=0;j<r.size();j++){ carry+=r[j]*58; r[j]=carry%256; carry/=256; }
         while(carry){ r.push_back(carry%256); carry/=256; }
@@ -2418,127 +2746,197 @@ inline string hex_encode(const vector<uint8_t>& data){ return _::H(data); }
 inline vector<uint8_t> hex_decode(const string& s){ return _::U(s); }
 
 // ==================== СЛУЧАЙНЫЕ ====================
-inline vector<uint8_t> random_bytes(size_t n){ return _::randb(n); }
+inline vector<uint8_t> random_bytes(size_t n){ return _::csrandb(n); }
 inline uint64_t random_int(uint64_t min,uint64_t max){
     return min+(_::rand64()%(max-min+1));
 }
 inline vector<uint8_t> random_prime(int bits){
-    vector<uint8_t> r=_::randb(bits/8);
-    r[0]|=0x80; r.back()|=1;
-    return r;
+if(bits<8) return {};
+return _bigint::to_bytes(_bigint::random_prime(bits));
 }
 
 // ==================== Кузнечик (ГОСТ Р 34.12-2018) ====================
+// ⚠ EXPERIMENTAL (AC_EXPERIMENTAL_KUZNECHIK)
+// Самосогласован: roundtrip/fuzz инверсны (enc/dec используют один KS).
+// НЕ соответствует RFC 7809 / ГОСТ Р 34.12-2018: ядро L не воспроизводит
+// официальный тест-вектор §4.1 (ключ 8899a0b7..., pt 112233445566778899aabbccddeeff00
+// -> ожидается 7f679d90bebc2430ba9af4ee86697cd8, фактически 4a1a13cd...).
+// Причина: реконструкция L по памяти исчерпана (3 полных перебора, 0 совпадений).
+// Для реального GOST-interop НЕ использовать. Для шифрования -> AES-256-GCM / ChaCha20-Poly1305.
+// Следующий шаг (если нужен合规 Кузнечик): verbatim-порт эталона RFC 7809 Appendix / Botan / libgcrypt,
+// НЕ реконструкция.
 namespace _kuznechik {
-    static const uint8_t PI[256]={
-        0xFC,0xEE,0xDD,0x11,0xCF,0x6E,0x31,0x16,0xFB,0xC4,0xFA,0xDA,0x23,0xC5,0x04,0x4D,
-        0xE9,0x77,0xF0,0xDB,0x93,0x2E,0x99,0xBA,0x17,0x36,0xF1,0xBB,0x14,0xCD,0x5F,0xC1,
-        0xF9,0x18,0x65,0x5A,0xE2,0x5C,0xEF,0x21,0x81,0x1C,0x3C,0x42,0x8B,0x01,0x8E,0x4F,
-        0x05,0x84,0x02,0xAE,0xE3,0x6A,0x8F,0xA0,0x06,0x0B,0xED,0x98,0x7F,0xD4,0xD3,0x1F,
-        0xEB,0x34,0x2C,0x51,0xEA,0xC8,0x48,0xAB,0xF2,0x2F,0x8D,0x27,0xA8,0x7A,0x97,0x2A,
-        0xE8,0x0C,0x22,0xDC,0x0A,0x7C,0x3F,0x24,0x12,0x4C,0xCE,0x6D,0x9E,0xA5,0x6F,0xAC,
-        0xE5,0x73,0x08,0x75,0x3E,0xC2,0x44,0xD0,0x29,0xA9,0xD9,0x6B,0x19,0x96,0x0F,0xBE,
-        0x47,0x0D,0x26,0xAA,0x3A,0xB4,0x4E,0x69,0x1A,0xA2,0x1D,0x7E,0x9F,0x2D,0xD1,0x85,
-        0x57,0x0E,0x61,0x66,0x45,0x3D,0x95,0x90,0x6C,0x5E,0x28,0x41,0x82,0x1B,0x30,0x7D,
-        0xF8,0x33,0xC6,0x8A,0x35,0xC7,0xA7,0xC3,0x52,0x32,0xB1,0xB5,0x8C,0x54,0xAD,0xDF,
-        0x4B,0xA1,0x00,0xE1,0x53,0x39,0x55,0xF7,0x5D,0x20,0xD7,0xA4,0xCA,0xB7,0xDD,0xE6,
-        0xF5,0x9A,0x03,0x58,0x10,0x5B,0xE4,0x07,0xFF,0x64,0xF4,0x6C,0x49,0x87,0xBC,0x9D,
-        0x62,0x09,0x46,0xD6,0x7B,0x71,0x2B,0xA6,0x89,0x37,0x13,0x9C,0x74,0xCC,0xB3,0xDE,
-        0x38,0xD2,0x70,0xB9,0x67,0x88,0x1E,0xE7,0x79,0x94,0xD8,0x91,0x86,0xA3,0xE0,0x25,
-        0x59,0x15,0xC0,0xF3,0xBD,0x68,0x60,0x9B,0x78,0xD5,0x50,0x92,0x4A,0x83,0x80,0x63,
-        0x76,0xC9,0x43,0xB6,0x0F,0x40,0x3B,0xFD,0xAF,0x56,0xBF,0x72,0xB2,0xF6,0xEC,0xFE
-    };
-    static const uint8_t INV_PI[256]={
-        0xA5,0x2D,0x32,0x8F,0x0E,0x30,0x38,0xC0,0x54,0xE6,0x9E,0x39,0x55,0x7C,0x81,0xEF,
-        0x16,0x03,0x6C,0x6A,0xCA,0x29,0x07,0x28,0x21,0x6E,0x78,0x8D,0x42,0x7A,0xDE,0x3F,
-        0xAD,0x27,0x56,0x0C,0x57,0xED,0x72,0x4B,0x8A,0x68,0x4F,0xC6,0x44,0x7D,0x15,0x49,
-        0x8E,0x06,0x99,0x91,0x41,0x94,0x19,0xC9,0xD0,0xA3,0x74,0xF6,0x2A,0x85,0x64,0x5E,
-        0xF5,0x8B,0x2B,0xF2,0x66,0x84,0xC2,0x70,0x46,0xBC,0xEC,0xA0,0x59,0x0F,0x76,0x2F,
-        0xEA,0x43,0x98,0xA2,0x9D,0xAA,0xF9,0x80,0xB3,0xE0,0x23,0xB5,0x25,0xA8,0x89,0x1E,
-        0xEE,0x82,0xC0,0xFF,0xBB,0x22,0x83,0xD4,0xE5,0x77,0x35,0x6B,0xB8,0x5B,0x05,0x5D,
-        0xD3,0xC5,0xFB,0x61,0xCC,0x63,0xF0,0x11,0xE8,0xD8,0x4D,0xC4,0x53,0x8F,0x7B,0x3C,
-        0xFE,0x48,0x8C,0xED,0x33,0x7F,0xDC,0xBD,0xD5,0xC8,0x93,0x4C,0x9C,0x4A,0x2E,0x36,
-        0x87,0xDB,0xEB,0x14,0xD9,0x86,0x6D,0x4E,0x3B,0x10,0xB1,0xE7,0xCB,0xBF,0x5C,0x7E,
-        0x37,0xA1,0x79,0xDD,0xAB,0x5D,0xC7,0x96,0x4C,0x69,0x73,0x47,0x5F,0x9A,0x34,0xE9,
-        0xF0,0x0A,0xFC,0xCE,0x75,0x9B,0xF3,0xAC,0x17,0xD7,0x08,0x1B,0xBE,0xE4,0x6F,0xFA,
-        0xE2,0x1F,0x65,0x97,0xA9,0x0D,0x92,0x95,0x45,0xF1,0xAE,0xE8,0xCD,0x1D,0x58,0x04,
-        0x67,0x7E,0xD1,0x3E,0x5D,0xE9,0xC3,0xAA,0xDA,0x6A,0x0B,0x13,0x53,0xAE,0xE0,0x9F,
-        0xDE,0xA3,0x24,0x34,0xB6,0x60,0xBF,0xD7,0x50,0x20,0x40,0x40,0xFE,0x3A,0x01,0x26,
-        0x12,0x1A,0x48,0xE3,0xBA,0xB0,0xFD,0xAB,0x90,0x00,0x02,0x09,0x00,0xF7,0xFF,0xBC
-    };
-    static const uint8_t L_VEC[16]={1,148,32,133,16,194,192,1,251,1,192,194,16,133,32,148};
-    
-    inline void LSX(uint8_t* a,const uint8_t* k){
-        for(int i=0;i<16;i++) a[i]=PI[a[i]^k[i]];
-        uint8_t b[16]; memcpy(b,a,16);
-        for(int i=0;i<16;i++){
-            a[i]=0;
-            for(int j=0;j<16;j++) if(b[j]&(1<<(7-i%8))) a[i]^=L_VEC[j];
+// GOST R 34.12-2018 pi
+static const uint8_t PI[256]={
+0xFC,0xEE,0xDD,0x11,0xCF,0x6E,0x31,0x16,0xFB,0xC4,0xFA,0xDA,0x23,0xC5,0x04,0x4D,
+0xE9,0x77,0xF0,0xDB,0x93,0x2E,0x99,0xBA,0x17,0x36,0xF1,0xBB,0x14,0xCD,0x5F,0xC1,
+0xF9,0x18,0x65,0x5A,0xE2,0x5C,0xEF,0x21,0x81,0x1C,0x3C,0x42,0x8B,0x01,0x8E,0x4F,
+0x05,0x84,0x02,0xAE,0xE3,0x6A,0x8F,0xA0,0x06,0x0B,0xED,0x98,0x7F,0xD4,0xD3,0x1F,
+0xEB,0x34,0x2C,0x51,0xEA,0xC8,0x48,0xAB,0xF2,0x2A,0x68,0xA2,0xFD,0x3A,0xCE,0xCC,
+0xB5,0x70,0x0E,0x56,0x08,0x0C,0x76,0x12,0xBF,0x72,0x13,0x47,0x9C,0xB7,0x5D,0x87,
+0x15,0xA1,0x96,0x29,0x10,0x7B,0x9A,0xC7,0xF3,0x91,0x78,0x6F,0x9D,0x9E,0xB2,0xB1,
+0x32,0x75,0x19,0x3D,0xFF,0x35,0x8A,0x7E,0x6D,0x54,0xC6,0x80,0xC3,0xBD,0x0D,0x57,
+0xDF,0xF5,0x24,0xA9,0x3E,0xA8,0x43,0xC9,0xD7,0x79,0xD6,0xF6,0x7C,0x22,0xB9,0x03,
+0xE0,0x0F,0xEC,0xDE,0x7A,0x94,0xB0,0xBC,0xDC,0xE8,0x28,0x50,0x4E,0x33,0x0A,0x4A,
+0xA7,0x97,0x60,0x73,0x1E,0x00,0x62,0x44,0x1A,0xB8,0x38,0x82,0x64,0x9F,0x26,0x41,
+0xAD,0x45,0x46,0x92,0x27,0x5E,0x55,0x2F,0x8C,0xA3,0xA5,0x7D,0x69,0xD5,0x95,0x3B,
+0x07,0x58,0xB3,0x40,0x86,0xAC,0x1D,0xF7,0x30,0x37,0x6B,0xE4,0x88,0xD9,0xE7,0x89,
+0xE1,0x1B,0x83,0x49,0x4C,0x3F,0xF8,0xFE,0x8D,0x53,0xAA,0x90,0xCA,0xD8,0x85,0x61,
+0x20,0x71,0x67,0xA4,0x2D,0x2B,0x09,0x5B,0xCB,0x9B,0x25,0xD0,0xBE,0xE5,0x6C,0x52,
+0x59,0xA6,0x74,0xD2,0xE6,0xF4,0xB4,0xC0,0xD1,0x66,0xAF,0xC2,0x39,0x4B,0x63,0xB6};
+
+static const uint8_t LC[16]={148,32,133,16,194,192,1,251,1,192,194,16,133,32,148,1};
+
+inline uint8_t gmul(uint8_t a,uint8_t b){
+    uint8_t r=0;
+    while(b){ if(b&1) r^=a; a=(a&0x80)?(uint8_t)((a<<1)^0xC3):(uint8_t)(a<<1); b>>=1; }
+    return r;
+}
+// KUZ_TABLES_STATIC_ARRAY
+inline const uint8_t* LT(){
+    static uint8_t T[16*256];
+    static const bool ready = [](){
+        for(int i=0;i<16;i++) {
+            for(int v=0;v<256;v++) {
+                T[(size_t)i*256 + (size_t)v] = gmul((uint8_t)v, LC[i]);
+            }
         }
-    }
-    inline void F(uint8_t* a,uint8_t* b,const uint8_t* k){
-        uint8_t c[16]; for(int i=0;i<16;i++) c[i]=a[i]^b[i];
-        LSX(c,k);
-        for(int i=0;i<16;i++) a[i]=c[i]^b[i];
-        memcpy(b,c,16);
-    }
-    inline void KeySchedule(const uint8_t* key,uint8_t rk[10][16]){
-        memcpy(rk[0],key,16); memcpy(rk[1],key+16,16);
-        uint8_t c[16]={0};
-        for(int i=0;i<4;i++){
-            F(rk[0],rk[1],c);
-            memcpy(rk[2*i+2],rk[0],16); memcpy(rk[2*i+3],rk[1],16);
+        return true;
+    }();
+    (void)ready;
+    return T;
+}
+inline const uint8_t* IP(){
+    static uint8_t T[256];
+    static const bool ready = [](){
+        for(int i=0;i<256;i++) {
+            T[PI[i]] = (uint8_t)i;
         }
+        return true;
+    }();
+    (void)ready;
+    return T;
+}
+inline void L(uint8_t* a){
+    const uint8_t* T=LT();
+    for(int r=0;r<16;r++){
+        uint8_t acc=0;
+        for(int i=0;i<16;i++) acc^=T[(size_t)i*256+a[i]];
+        for(int i=15;i>0;i--) a[i]=a[i-1];
+        a[0]=acc;
     }
-    
-    inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& plain,const vector<uint8_t>& key){
-        uint8_t rk[10][16]; KeySchedule(key.data(),rk);
-        vector<uint8_t> blk=plain;
-        for(int r=0;r<9;r++){ LSX(blk.data(),rk[r]); }
-        for(int i=0;i<16;i++) blk[i]^=rk[9][i];
-        return blk;
+}
+inline void InvL(uint8_t* a){
+    const uint8_t* T=LT();
+    for(int r=0;r<16;r++){
+        uint8_t acc=a[0];
+        for(int i=0;i<15;i++) acc^=T[(size_t)i*256+a[i+1]];
+        for(int i=0;i<15;i++) a[i]=a[i+1];
+        a[15]=acc;
     }
+}
+inline void LSX(uint8_t* a,const uint8_t* k){
+    for(int i=0;i<16;i++) a[i]=PI[(uint8_t)(a[i]^k[i])];
+    L(a);
+}
+inline void InvLSX(uint8_t* a,const uint8_t* k){
+    const uint8_t* ip=IP();
+    InvL(a);
+    for(int i=0;i<16;i++) a[i]=ip[a[i]];
+    for(int i=0;i<16;i++) a[i]^=k[i];
+}
+inline void iterC(uint8_t* out,int num){ memset(out,0,16); out[15]=(uint8_t)num; L(out); }
+inline void KS(const uint8_t* key,uint8_t rk[10][16]){
+    memcpy(rk[0],key,16); memcpy(rk[1],key+16,16);
+    for(int i=0;i<4;i++){
+        uint8_t a[16],b[16],c[16],t[16];
+        memcpy(a,rk[2*i],16); memcpy(b,rk[2*i+1],16);
+        for(int j=0;j<8;j++){
+            iterC(c,8*i+j+1);
+            memcpy(t,a,16); LSX(t,c);
+            for(int q=0;q<16;q++) t[q]^=b[q];
+            memcpy(b,a,16); memcpy(a,t,16);
+        }
+        memcpy(rk[2*i+2],a,16); memcpy(rk[2*i+3],b,16);
+    }
+}
+inline vector<uint8_t> enc(const vector<uint8_t>& pt,const vector<uint8_t>& key){
+    if(pt.size()!=16||key.size()!=32) return {};
+    uint8_t rk[10][16]; KS(key.data(),rk);
+    uint8_t s[16]; memcpy(s,pt.data(),16);
+    for(int r=0;r<9;r++) LSX(s,rk[r]);
+    for(int i=0;i<16;i++) s[i]^=rk[9][i];
+    return vector<uint8_t>(s,s+16);
+}
+inline vector<uint8_t> dec(const vector<uint8_t>& ct,const vector<uint8_t>& key){
+    if(ct.size()!=16||key.size()!=32) return {};
+    uint8_t rk[10][16]; KS(key.data(),rk);
+    uint8_t s[16]; memcpy(s,ct.data(),16);
+    for(int i=0;i<16;i++) s[i]^=rk[9][i];
+    for(int r=8;r>=0;r--) InvLSX(s,rk[r]);
+    return vector<uint8_t>(s,s+16);
+}
+
+inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& p,const vector<uint8_t>& k){ return enc(p,k); }
+inline vector<uint8_t> decrypt_raw(const vector<uint8_t>& c,const vector<uint8_t>& k){ return dec(c,k); }
+
 }
 
 inline vector<uint8_t> kuznechik_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key){
     return _kuznechik::encrypt_raw(plain,key);
 }
 inline vector<uint8_t> kuznechik_decrypt(const vector<uint8_t>& cipher,const vector<uint8_t>& key){
-    return _kuznechik::encrypt_raw(cipher,key);
+    return _kuznechik::decrypt_raw(cipher,key);
 }
 
 // ==================== Магма (ГОСТ 28147-89) ====================
 namespace _magma {
-    static const uint8_t SBOX[8][16]={
-        {4,10,9,2,13,8,0,14,6,11,1,12,7,15,5,3},
-        {14,11,4,12,6,13,15,10,2,3,8,1,0,7,5,9},
-        {5,8,1,13,10,3,4,2,14,15,12,7,6,0,9,11},
-        {7,13,10,1,0,8,9,15,14,4,6,12,11,2,5,3},
-        {6,12,7,1,5,15,13,8,4,10,9,14,0,3,11,2},
-        {4,11,10,0,7,2,1,13,3,6,8,5,9,12,15,14},
-        {13,11,4,1,3,15,5,9,0,10,14,7,6,8,2,12},
-        {1,15,13,0,5,7,10,4,9,2,3,14,6,11,8,12}
-    };
-    inline uint32_t t(uint32_t v){
-        uint32_t r=0;
-        for(int i=0;i<8;i++) r|=SBOX[i][(v>>(4*i))&0xF]<<(4*i);
-        return (r<<11)|(r>>21);
-    }
-    inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& plain,const vector<uint8_t>& key){
-        vector<uint8_t> blk=plain;
-        uint32_t a=*((uint32_t*)&blk[0]),b=*((uint32_t*)&blk[4]);
-        uint32_t K[8]; memcpy(K,key.data(),32);
-        for(int r=0;r<31;r++){ uint32_t tmp=b^t(a+K[r%8]); b=a; a=tmp; }
-        *((uint32_t*)&blk[0])=b; *((uint32_t*)&blk[4])=a;
-        return blk;
-    }
+// GOST 28147-89, id-GostR3411-94-TestParamSet
+static const uint8_t SBOX[8][16]={
+{4,10,9,2,13,8,0,14,6,11,1,12,7,15,5,3},
+{14,11,4,12,6,13,15,10,2,3,8,1,0,7,5,9},
+{5,8,1,13,10,3,4,2,14,15,12,7,6,0,9,11},
+{7,13,10,1,0,8,9,15,14,4,6,12,11,2,5,3},
+{6,12,7,1,5,15,13,8,4,10,9,14,0,3,11,2},
+{4,11,10,0,7,2,1,13,3,6,8,5,9,12,15,14},
+{13,11,4,1,3,15,5,9,0,10,14,7,6,8,2,12},
+{1,15,13,0,5,7,10,4,9,2,3,14,6,11,8,12}};
+
+inline uint32_t t(uint32_t v){
+    uint32_t r=0;
+    for(int i=0;i<8;i++) r|=(uint32_t)SBOX[i][(v>>(4*i))&0xF]<<(4*i);
+    return (r<<11)|(r>>21);
+}
+inline void ldK(const vector<uint8_t>& key,uint32_t K[8]){
+    for(int i=0;i<8;i++) memcpy(&K[i],key.data()+4*i,4);
+}
+inline vector<uint8_t> enc(const vector<uint8_t>& pt,const vector<uint8_t>& key){
+    if(pt.size()!=8||key.size()!=32) return {};
+    uint32_t K[8]; ldK(key,K);
+    uint32_t n1,n2; memcpy(&n1,pt.data(),4); memcpy(&n2,pt.data()+4,4);
+    for(int j=0;j<3;j++) for(int i=0;i<8;i+=2){ n2^=t(n1+K[i]); n1^=t(n2+K[i+1]); }
+    for(int i=8;i>0;i-=2){ n2^=t(n1+K[i-1]); n1^=t(n2+K[i-2]); }
+    vector<uint8_t> o(8); memcpy(o.data(),&n2,4); memcpy(o.data()+4,&n1,4); return o;
+}
+inline vector<uint8_t> dec(const vector<uint8_t>& ct,const vector<uint8_t>& key){
+    if(ct.size()!=8||key.size()!=32) return {};
+    uint32_t K[8]; ldK(key,K);
+    uint32_t n1,n2; memcpy(&n1,ct.data(),4); memcpy(&n2,ct.data()+4,4);
+    for(int i=0;i<8;i+=2){ n2^=t(n1+K[i]); n1^=t(n2+K[i+1]); }
+    for(int j=0;j<3;j++) for(int i=8;i>0;i-=2){ n2^=t(n1+K[i-1]); n1^=t(n2+K[i-2]); }
+    vector<uint8_t> o(8); memcpy(o.data(),&n2,4); memcpy(o.data()+4,&n1,4); return o;
+}
+
+inline vector<uint8_t> encrypt_raw(const vector<uint8_t>& p,const vector<uint8_t>& k){ return enc(p,k); }
+inline vector<uint8_t> decrypt_raw(const vector<uint8_t>& c,const vector<uint8_t>& k){ return dec(c,k); }
+
 }
 
 inline vector<uint8_t> magma_encrypt(const vector<uint8_t>& plain,const vector<uint8_t>& key){
     return _magma::encrypt_raw(plain,key);
 }
 inline vector<uint8_t> magma_decrypt(const vector<uint8_t>& cipher,const vector<uint8_t>& key){
-    return _magma::encrypt_raw(cipher,key);
+    return _magma::decrypt_raw(cipher,key);
 }
 
 // ==================== fs.h (ПОЛНОСТЬЮ ПЕРЕПИСАННЫЙ, БЕЗ ИМПОРТОВ) ====================
@@ -2737,8 +3135,9 @@ public:
         _data = aes256_gcm_encrypt(_data, key);
     }
     bool decrypt(const vector<uint8_t>& key) {
-        return aes256_gcm_decrypt(_data, key, _data);
-    }
+    if (aes256_gcm_decrypt(_data, key, _data)) return true;
+    return aes256_gcm_decrypt_legacy(_data, key, _data);
+}
     
     // С солью
     void encrypt_salted(const vector<uint8_t>& key, uint64_t salt) {
@@ -2925,11 +3324,13 @@ inline double grad(int hash, double x, double y) {
 }
 
 inline vector<unsigned char> gen_perm(int seed) {
-    vector<unsigned char> p(256);
-    for (int i = 0; i < 256; i++) p[i] = i;
-    mt19937 gen(seed);
-    shuffle(p.begin(), p.end(), gen);
-    return p;
+vector<unsigned char> p(256);
+for (int i = 0; i < 256; i++) p[i] = (unsigned char)i;
+mt19937 gen(seed);
+shuffle(p.begin(), p.end(), gen);
+p.resize(512);
+for (int i = 0; i < 256; i++) p[256 + i] = p[i];
+return p;
 }
 
 inline const vector<unsigned char>& get_perm(int seed) {
@@ -2940,6 +3341,8 @@ inline const vector<unsigned char>& get_perm(int seed) {
 
 // ===== БАЗОВЫЙ ШУМ =====
 inline double noise(double x, double y, int seed, double scale, int octaves) {
+if (octaves < 1) return 0.0;
+if (octaves > 30) octaves = 30;
     const auto& p = get_perm(seed);
     double result = 0, max_val = 0, amp = 1;
     for (int o = 0; o < octaves; o++) {
@@ -3544,6 +3947,129 @@ namespace rand_aes {
 } // namespace rand_aes
 
 } // namespace rand_pp
+
+
+// ==================== Password hashing: default PBKDF2-HMAC-SHA256 ====================
+namespace _pw {
+
+inline string b64url_encode(const vector<uint8_t>& in){
+    static const char alph[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        uint32_t n = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | (uint32_t)in[i+2];
+        out.push_back(alph[(n >> 18) & 63]);
+        out.push_back(alph[(n >> 12) & 63]);
+        out.push_back(alph[(n >> 6) & 63]);
+        out.push_back(alph[n & 63]);
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        uint32_t n = (uint32_t)in[i] << 16;
+        out.push_back(alph[(n >> 18) & 63]);
+        out.push_back(alph[(n >> 12) & 63]);
+    } else if (i + 2 == in.size()) {
+        uint32_t n = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8);
+        out.push_back(alph[(n >> 18) & 63]);
+        out.push_back(alph[(n >> 12) & 63]);
+        out.push_back(alph[(n >> 6) & 63]);
+    }
+    return out;
+}
+
+inline int b64url_val(char c){
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
+    if (c >= '0' && c <= '9') return 52 + (c - '0');
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+inline vector<uint8_t> b64url_decode(const string& s){
+    vector<uint8_t> r;
+    uint32_t buffer = 0; int bits = 0;
+    for (char c : s) {
+        if (c == '=') continue;
+        int v = b64url_val(c);
+        if (v < 0) return vector<uint8_t>();
+        buffer = (buffer << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            r.push_back((uint8_t)((buffer >> bits) & 0xFF));
+            buffer &= (1u << bits) - 1;
+        }
+    }
+    // Canonical base64url: unused trailing bits must be zero; length mod 4 == 1 invalid.
+    if (bits == 6) return vector<uint8_t>();
+    if (bits != 0 && buffer != 0) return vector<uint8_t>();
+    return r;
+}
+
+inline string password_hash(const string& pass, int iterations = 100000){
+    if (iterations < 1000) iterations = 1000;
+    if (iterations > 100000000) iterations = 100000000;
+
+    vector<uint8_t> salt = _::csrandb(16);
+    vector<uint8_t> dk = pbkdf2_sha256(pass, salt, iterations);
+
+    return string("$pbkdf2-sha256$") + to_string(iterations) + "$"
+         + b64url_encode(salt) + "$" + b64url_encode(dk);
+}
+
+inline bool password_verify(const string& pass, const string& stored){
+    if (stored.empty() || stored[0] != '$') return false;
+
+    size_t p1 = stored.find('$', 1);
+    if (p1 == string::npos) return false;
+    size_t p2 = stored.find('$', p1 + 1);
+    if (p2 == string::npos) return false;
+    size_t p3 = stored.find('$', p2 + 1);
+    if (p3 == string::npos) return false;
+
+    string algo = stored.substr(1, p1 - 1);
+    if (algo != "pbkdf2-sha256") return false;
+
+    string iter_s = stored.substr(p1 + 1, p2 - p1 - 1);
+    if (iter_s.empty()) return false;
+
+    long long iter_ll = 0;
+    for (char c : iter_s) {
+        if (c < '0' || c > '9') return false;
+        if (iter_ll > 10000000LL) return false;
+        iter_ll = iter_ll * 10 + (c - '0');
+        if (iter_ll > 100000000LL) return false;
+    }
+    if (iter_ll < 1 || iter_ll > 100000000LL) return false;
+    int iterations = (int)iter_ll;
+
+    vector<uint8_t> salt = b64url_decode(stored.substr(p2 + 1, p3 - p2 - 1));
+    vector<uint8_t> want = b64url_decode(stored.substr(p3 + 1));
+    if (salt.empty() || want.empty()) return false;
+    if (salt.size() > 64 || want.size() > 128) return false;
+
+    vector<uint8_t> got = pbkdf2_sha256(pass, salt, iterations);
+    if (got.size() != want.size()) return false;
+
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        diff |= (uint8_t)(got[i] ^ want[i]);
+    }
+    return diff == 0;
+}
+
+// Experimental wrappers: не использовать по умолчанию.
+inline string password_hash_bcrypt_experimental(const string& pass, unsigned int cost = 12){
+    return bcrypt_hash(pass, cost);
+}
+
+inline bool password_verify_bcrypt_experimental(const string& pass, const string& hash){
+    return bcrypt_check(pass, hash);
+}
+
+} // namespace _pw
 
 // ===================================================================
 // КОНЕЦ all_crypto.h
